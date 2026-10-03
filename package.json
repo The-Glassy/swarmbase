@@ -1,0 +1,34 @@
+{
+  "name": "@animalabs/swarmbase",
+  "version": "0.1.0",
+  "description": "SwarmBase \u2014 workflow orchestration for Connectome residents as an MCPL server: a resident submits an orchestration script, SwarmBase fans out subagents and pushes the result back; tailnet dashboard for monitoring.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "bin": {
+    "swarmbase": "./dist/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "start": "node dist/src/index.js",
+    "test": "npm run build && node --test dist/test/"
+  },
+  "dependencies": {
+    "@animalabs/mcpl-core": "^0.2.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/swarmbase.git"
+  },
+  "homepage": "https://github.com/anima-research/swarmbase#readme"
+}

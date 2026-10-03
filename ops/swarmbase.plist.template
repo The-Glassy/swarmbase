@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd agent for SwarmBase. Replace __REPO__, __NODE_BIN__ (dir with node),
+     __CLI_BIN__ (dir with the claude CLI) and __LOG__, then:
+     cp to ~/Library/LaunchAgents/<label>.plist && launchctl load <that file> -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>swarmbase</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>export PATH=__NODE_BIN__:__CLI_BIN__:/usr/local/bin:/usr/bin:/bin &amp;&amp; cd __REPO__ &amp;&amp; exec node __REPO__/dist/src/index.js</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+</dict>
+</plist>

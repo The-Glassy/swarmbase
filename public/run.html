@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwarmBase run</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1><a href="/">SwarmBase</a></h1>
+    <span class="sub" id="crumb"></span>
+    <span class="who" id="who"></span>
+  </header>
+
+  <div class="panel runhead" id="head"><div class="muted">Loading…</div></div>
+
+  <div class="grid">
+    <div>
+      <div class="panel section">
+        <h3>Agents <span class="count" id="agent-count"></span></h3>
+        <div id="phases"><div class="empty">No agents yet.</div></div>
+      </div>
+      <div class="panel section">
+        <h3>Log <span class="count" id="log-count"></span></h3>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+    <div class="drill">
+      <div class="panel section">
+        <h3 id="drill-title">Agent detail</h3>
+        <div class="body" id="drill"><div class="empty">Select an agent to see its prompt and transcript.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel section">
+    <div class="tabs" id="tabs">
+      <button data-tab="result" class="on">Result</button>
+      <button data-tab="script">Script</button>
+      <button data-tab="args">Args</button>
+    </div>
+    <pre class="code" id="tab-body"></pre>
+  </div>
+</div>
+<script src="/static/common.js"></script>
+<script>
+const RUN_ID = decodeURIComponent(location.pathname.split('/')[2] || '');
+const S = { meta: null, live: false, script: '', args: null, result: null, lastSeq: 0, agents: new Map(), phases: [], logs: [], selected: null, tab: 'result' };
+
+function applyEvent(e) {
+  if (e.seq <= S.lastSeq) return false;
+  S.lastSeq = e.seq;
+  const m = S.meta;
+  switch (e.type) {
+    case 'phase':
+      if (!S.phases.includes(e.title)) S.phases.push(e.title);
+      if (m) m.currentPhase = e.title;
+      S.logs.push({ ts: e.ts, text: `── phase: ${e.title}`, sys: true });
+      break;
+    case 'log': S.logs.push({ ts: e.ts, text: e.message }); break;
+    case 'agent_queued': {
+      const ph = e.phase || '(no phase)';
+      if (!S.phases.includes(ph)) S.phases.push(ph);
+      S.agents.set(e.n, { n: e.n, label: e.label, phase: ph, model: e.model, profile: e.profile, effort: e.effort, engine: e.engine, status: 'queued', cost: 0, ms: 0, activity: '', error: null, startTs: null });
+      if (m) m.agentsTotal = Math.max(m.agentsTotal, e.n);
+      break;
+    }
+    case 'agent_start': { const a = S.agents.get(e.n); if (a) { a.status = 'running'; a.startTs = e.ts; } break; }
+    case 'agent_activity': { const a = S.agents.get(e.n); if (a) a.activity = `${e.kind}: ${e.summary}`; break; }
+    case 'agent_end': {
+      const a = S.agents.get(e.n);
+      if (a) { a.status = e.status; a.cost = e.costUsd; a.ms = e.durationMs; a.error = e.error || null; a.result = e.resultPreview || null; }
+      if (m && e.costUsd) m.spentUsd = (m.spentUsd || 0) + 0; // authoritative spend arrives with meta refresh
+      break;
+    }
+    case 'run_end':
+      if (m) { m.status = e.status; m.spentUsd = e.spentUsd; m.error = e.error; m.endedAt = e.ts; }
+      S.live = false;
+      S.logs.push({ ts: e.ts, text: `── run ${e.status}${e.error ? ': ' + e.error : ''}`, sys: true });
+      loadResult();
+      break;
+  }
+  return true;
+}
+
+function counts() {
+  const c = { ok: 0, cached: 0, running: 0, queued: 0, bad: 0 };
+  for (const a of S.agents.values()) {
+    if (a.status === 'ok') c.ok++; else if (a.status === 'cached') c.cached++;
+    else if (a.status === 'running') c.running++; else if (a.status === 'queued') c.queued++; else c.bad++;
+  }
+  return c;
+}
+
+function renderHead() {
+  const m = S.meta;
+  if (!m) return;
+  document.title = `${m.label || m.id} · SwarmBase`;
+  document.getElementById('crumb').innerHTML = `<span class="mono">${esc(m.id)}</span>`;
+  const spent = S.agentsSpent();
+  const pct = Math.min(100, 100 * spent / Math.max(0.0001, m.budgetUsd));
+  const c = counts();
+  const end = m.endedAt ? Date.parse(m.endedAt) : Date.now();
+  const canCancel = S.live && WHO.admin;
+  document.getElementById('head').innerHTML = `
+    <div class="title">
+      ${chip(m.status)}
+      <h2>${esc(m.label || '(unnamed run)')}</h2>
+      <span class="mono muted">${esc(m.id)}</span>
+      ${m.resumedFrom ? `<span class="muted">resumed from <a class="mono" href="/runs/${esc(m.resumedFrom)}">${esc(m.resumedFrom)}</a></span>` : ''}
+      <span style="margin-left:auto"></span>
+      ${canCancel ? '<button class="danger" id="cancel">Cancel run</button>' : ''}
+    </div>
+    <div class="facts">
+      <span>Caller <b>${esc(m.caller)}</b>${S.callerConnected === false ? ' <span class="muted">(offline — notice queued)</span>' : ''}</span>
+      <span>Phase <b>${esc(m.currentPhase || '—')}</b></span>
+      <span>Agents <b>${c.ok + c.cached}/${S.agents.size}</b> done${c.running ? ` · <b>${c.running}</b> running` : ''}${c.queued ? ` · <b>${c.queued}</b> queued` : ''}${c.bad ? ` · <b>${c.bad}</b> null` : ''}</span>
+      <span>Duration <b>${dur(end - Date.parse(m.createdAt))}</b></span>
+      <span>Started <b title="${esc(m.createdAt)}">${ago(m.createdAt)}</b></span>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <span class="muted" style="font-size:13px">Spent <b class="mono" style="color:var(--ink)">${money3(spent)}</b> of ${money(m.budgetUsd)}</span>
+      <div class="bar" style="flex:1;max-width:420px"><span class="b-money" style="width:${pct.toFixed(1)}%"></span></div>
+      ${Object.keys(m.defaults || {}).length ? `<span class="muted mono" style="font-size:12px">${esc(Object.entries(m.defaults).map(([k, v]) => k + '=' + v).join(' '))}</span>` : ''}
+    </div>
+    ${m.error ? `<div class="error">${esc(m.error)}</div>` : ''}`;
+  const btn = document.getElementById('cancel');
+  if (btn) btn.onclick = async () => {
+    if (!confirm('Cancel this run? Running agents are stopped; finished results stay cached for resume.')) return;
+    btn.disabled = true;
+    try { await postJSON(`/api/runs/${encodeURIComponent(RUN_ID)}/cancel`); } catch (e) { alert(e.message); btn.disabled = false; }
+  };
+}
+S.agentsSpent = () => {
+  let s = 0;
+  for (const a of S.agents.values()) s += a.cost || 0;
+  return Math.max(s, S.meta?.status !== 'running' ? (S.meta?.spentUsd || 0) : 0);
+};
+
+function renderAgents() {
+  const el = document.getElementById('phases');
+  document.getElementById('agent-count').textContent = S.agents.size ? `${S.agents.size}` : '';
+  if (!S.agents.size) { el.innerHTML = '<div class="empty">No agents yet.</div>'; return; }
+  const byPhase = new Map(S.phases.map((p) => [p, []]));
+  for (const a of S.agents.values()) { if (!byPhase.has(a.phase)) byPhase.set(a.phase, []); byPhase.get(a.phase).push(a); }
+  const now = Date.now();
+  el.innerHTML = [...byPhase.entries()].filter(([, list]) => list.length).map(([phase, list]) => {
+    const done = list.filter((a) => a.status === 'ok' || a.status === 'cached').length;
+    const run = list.filter((a) => a.status === 'running').length;
+    const pct = (v) => (100 * v / list.length).toFixed(1) + '%';
+    return `<div class="phase">
+      <div class="phase-title">${esc(phase)} <span class="muted mono" style="font-weight:400">${done}/${list.length}</span>
+        <div class="bar"><span class="b-ok" style="width:${pct(done)}"></span><span class="b-run" style="left:${pct(done)};width:${pct(run)}"></span></div>
+      </div>
+      ${list.map((a) => {
+        const ms = a.status === 'running' && a.startTs ? now - Date.parse(a.startTs) : a.ms;
+        const detail = a.status === 'running' ? a.activity : a.error ? a.error : a.result || '';
+        return `<div class="agent${S.selected === a.n ? ' sel' : ''}" data-n="${a.n}">
+          <div class="n">#${a.n}</div>
+          <div class="lbl" title="${esc(a.label)}">${esc(a.label)}</div>
+          <div class="right">${ms ? dur(ms) : ''} ${a.cost ? money3(a.cost) : ''} ${chip(a.status)}</div>
+          <div class="meta">${esc(a.model)} · ${esc(a.profile)}${a.effort ? ' · ' + esc(a.effort) : ''}${detail ? ' — ' + esc(detail) : ''}</div>
+        </div>`;
+      }).join('')}
+    </div>`;
+  }).join('');
+}
+
+function renderLog() {
+  const el = document.getElementById('log');
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+  document.getElementById('log-count').textContent = S.logs.length ? String(S.logs.length) : '';
+  el.innerHTML = S.logs.length ? S.logs.map((l) => `<div${l.sys ? ' class="muted"' : ''}><span class="t">${esc(l.ts.slice(11, 19))}</span>${esc(l.text)}</div>`).join('') : '<div class="muted">No log lines.</div>';
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+function renderTab() {
+  const body = document.getElementById('tab-body');
+  for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('on', b.dataset.tab === S.tab);
+  if (S.tab === 'script') body.textContent = S.script || '';
+  else if (S.tab === 'args') body.textContent = JSON.stringify(S.args, null, 2);
+  else body.textContent = S.result !== null ? S.result : (S.live ? 'Run in progress — the result appears when the script returns.' : 'No return value.');
+}
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-tab]');
+  if (b) { S.tab = b.dataset.tab; renderTab(); }
+});
+
+async function loadResult() {
+  try { S.result = (await getJSON(`/api/runs/${encodeURIComponent(RUN_ID)}/result`)).text; } catch { S.result = null; }
+  renderTab();
+}
+
+// ── drill-down ──
+let drillTimer = null;
+async function loadDrill(n) {
+  const a = S.agents.get(n);
+  const title = document.getElementById('drill-title');
+  const el = document.getElementById('drill');
+  try {
+    const d = await getJSON(`/api/runs/${encodeURIComponent(RUN_ID)}/agents/${n}`);
+    if (S.selected !== n) return;
+    const keepScroll = el.scrollTop;
+    const canSkip = WHO.admin && a && (a.status === 'running' || a.status === 'queued');
+    title.innerHTML = `#${n} ${esc(a?.label || '')} <span class="count">${a ? chip(a.status) : ''} ${canSkip ? '<button id="skip" style="margin-left:8px">Skip</button>' : ''}</span>`;
+    const items = [`<div class="tx prompt"><div class="kind">prompt</div><div class="content">${esc(d.prompt || '')}</div></div>`];
+    if (d.schema) items.push(`<div class="tx tool_use"><div class="kind">schema</div><div class="content">${esc(JSON.stringify(d.schema, null, 2))}</div></div>`);
+    for (const t of d.transcript) {
+      if (t.kind === 'init') items.push(`<div class="tx init"><div class="kind">session</div><div class="content">${esc(t.model)} · tools: ${esc((t.tools || []).join(', ') || 'none')}\ncwd: ${esc(t.cwd || '')}</div></div>`);
+      else if (t.kind === 'text') items.push(`<div class="tx text"><div class="kind">assistant</div><div class="content">${esc(t.text)}</div></div>`);
+      else if (t.kind === 'thinking') { if (t.text) items.push(`<div class="tx thinking"><div class="kind">thinking</div><div class="content">${esc(t.text)}</div></div>`); }
+      else if (t.kind === 'tool_use') items.push(`<div class="tx tool_use"><div class="kind">tool · ${esc(t.name)}</div><div class="content">${esc(t.input)}</div></div>`);
+      else if (t.kind === 'tool_result') items.push(`<div class="tx tool_result${t.isError ? ' err' : ''}"><div class="kind">result${t.isError ? ' · error' : ''}</div><div class="content">${esc(t.text)}</div></div>`);
+      else if (t.kind === 'result') items.push(`<div class="tx result"><div class="kind">end · ${esc(t.subtype)}</div><div class="content">${esc(Number(t.turns) || '?')} turns · ${dur(t.durationMs)} · ${money3(t.costUsd)} (the CLI's own estimate; a gateway ledger, if any, is authoritative)</div></div>`);
+    }
+    if (a?.error) items.push(`<div class="tx"><div class="kind">swarmbase</div><div class="content error">${esc(a.error)}</div></div>`);
+    el.innerHTML = items.join('');
+    el.scrollTop = keepScroll;
+    const skip = document.getElementById('skip');
+    if (skip) skip.onclick = async () => {
+      skip.disabled = true;
+      try { await postJSON(`/api/runs/${encodeURIComponent(RUN_ID)}/agents/${n}/skip`); } catch (e) { alert(e.message); skip.disabled = false; }
+    };
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load agent: ${esc(e.message)}</div>`;
+  }
+  clearTimeout(drillTimer);
+  const cur = S.agents.get(n);
+  if (cur && (cur.status === 'running' || cur.status === 'queued')) drillTimer = setTimeout(() => loadDrill(n), 2500);
+}
+document.getElementById('phases').addEventListener('click', (e) => {
+  const row = e.target.closest('.agent[data-n]');
+  if (!row) return;
+  S.selected = Number(row.dataset.n);
+  renderAgents();
+  loadDrill(S.selected);
+});
+
+function renderAll() { renderHead(); renderAgents(); renderLog(); }
+
+async function boot() {
+  await showWho();
+  let d;
+  try { d = await getJSON(`/api/runs/${encodeURIComponent(RUN_ID)}`); }
+  catch (e) { document.getElementById('head').innerHTML = `<div class="error">${esc(e.message)}</div>`; return; }
+  S.meta = d.meta; S.live = d.live; S.script = d.script; S.args = d.args; S.callerConnected = d.callerConnected;
+  S.phases = [];
+  for (const e of d.events) applyEvent(e);
+  S.meta.status = d.meta.status; S.meta.spentUsd = d.meta.spentUsd;
+  renderAll();
+  if (!S.live) loadResult(); else renderTab();
+  if (S.live) {
+    const es = new EventSource(`/api/runs/${encodeURIComponent(RUN_ID)}/events?since=${S.lastSeq}`);
+    let pending = false;
+    es.onmessage = (msg) => {
+      let e; try { e = JSON.parse(msg.data); } catch { return; }
+      if (applyEvent(e) && !pending) { pending = true; requestAnimationFrame(() => { pending = false; renderAll(); }); }
+      if (e.type === 'run_end') es.close();
+    };
+  }
+  setInterval(() => { if (S.live) renderHead(), renderAgents(); }, 1000);
+}
+boot();
+</script>
+</body>
+</html>

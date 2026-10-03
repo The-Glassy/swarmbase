@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwarmBase</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1><a href="/">SwarmBase</a></h1>
+    <span class="sub">orchestrated subagent runs</span>
+    <span class="who" id="who"></span>
+  </header>
+
+  <div class="stats">
+    <div class="panel stat"><div class="k">Live runs</div><div class="v" id="st-runs">–</div></div>
+    <div class="panel stat"><div class="k">Agents running</div><div class="v" id="st-agents">–</div></div>
+    <div class="panel stat"><div class="k">Agents queued</div><div class="v" id="st-queued">–</div></div>
+    <div class="panel stat"><div class="k">Spent (shown runs)</div><div class="v" id="st-spent">–</div></div>
+  </div>
+
+  <div class="panel scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>Status</th><th>Run</th><th>Caller</th><th>Phase</th><th>Agents</th><th class="num">Spent</th><th class="num">Duration</th><th class="num">Started</th>
+        </tr>
+      </thead>
+      <tbody id="rows"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+<script src="/static/common.js"></script>
+<script>
+const rows = document.getElementById('rows');
+
+function agentsCell(m) {
+  const c = m.counts, total = Math.max(1, m.agentsTotal);
+  const pct = (v) => (100 * v / total).toFixed(1) + '%';
+  const ok = c.ok, cached = c.cached, run = c.running, bad = c.null + c.error + c.skipped;
+  return `<div style="display:flex;gap:8px;align-items:center">
+    <div class="bar" style="flex:1">
+      <span class="b-ok" style="width:${pct(ok)}"></span>
+      <span class="b-cache" style="left:${pct(ok)};width:${pct(cached)}"></span>
+      <span class="b-run" style="left:${pct(ok + cached)};width:${pct(run)}"></span>
+      <span class="b-bad" style="left:${pct(ok + cached + run)};width:${pct(bad)}"></span>
+    </div>
+    <span class="mono muted">${ok + cached}/${m.agentsTotal}</span></div>`;
+}
+
+async function refresh() {
+  try {
+    const data = await getJSON('/api/runs?limit=200');
+    document.getElementById('st-runs').textContent = data.stats.activeRuns;
+    document.getElementById('st-agents').textContent = data.stats.agentsRunning;
+    document.getElementById('st-queued').textContent = data.stats.agentsQueued;
+    document.getElementById('st-spent').textContent = money(data.runs.reduce((s, m) => s + m.spentUsd, 0));
+    if (!data.runs.length) { rows.innerHTML = '<tr><td colspan="8" class="empty">No runs yet.</td></tr>'; return; }
+    rows.innerHTML = data.runs.map((m) => `
+      <tr data-id="${esc(m.id)}">
+        <td>${chip(m.status)}</td>
+        <td><div style="font-weight:500">${esc(m.label || '(unnamed)')}</div><div class="mono muted">${esc(m.id)}${m.resumedFrom ? ' ← ' + esc(m.resumedFrom) : ''}</div></td>
+        <td>${esc(m.caller)}</td>
+        <td class="muted">${esc(m.currentPhase || '—')}</td>
+        <td style="min-width:160px">${agentsCell(m)}</td>
+        <td class="num mono">${money(m.spentUsd)} <span class="muted">/ ${money(m.budgetUsd)}</span></td>
+        <td class="num mono">${dur((m.endedAt ? Date.parse(m.endedAt) : Date.now()) - Date.parse(m.createdAt))}</td>
+        <td class="num muted" title="${esc(m.createdAt)}">${ago(m.createdAt)}</td>
+      </tr>`).join('');
+  } catch (e) {
+    rows.innerHTML = `<tr><td colspan="8" class="empty">Could not load runs: ${esc(e.message)}</td></tr>`;
+  }
+}
+rows.addEventListener('click', (e) => {
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) location.href = '/runs/' + encodeURIComponent(tr.dataset.id);
+});
+showWho();
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
