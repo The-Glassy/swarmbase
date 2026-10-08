@@ -70,6 +70,7 @@ export interface StartRunInput {
   defaults: AgentDefaults;
   budgetUsd: number;
   resumeFrom: string | null;
+  keepWork?: boolean;
 }
 
 interface ResolvedAgent {
@@ -132,6 +133,7 @@ export class RunManager {
       defaults: input.defaults,
       budgetUsd: input.budgetUsd,
       resumedFrom: input.resumeFrom,
+      keepWork: input.keepWork,
     });
     this.store.emit(meta.id, { type: 'run_start', caller: meta.caller, label: meta.label, budgetUsd: meta.budgetUsd, resumedFrom: meta.resumedFrom });
 
@@ -322,6 +324,11 @@ export class RunManager {
         this.store.emit(meta.id, { type: 'run_end', status, spentUsd: meta.spentUsd, error });
       } catch (e) {
         console.error(`[swarmbase] run ${meta.id} final bookkeeping failed:`, e);
+      }
+      // The work dir (clones, toolchains, scratch) is the bulk of a run on disk and
+      // nothing reads it after the end: resume starts a fresh run with its own.
+      if (this.cfg.deleteWorkOnEnd && !meta.keepWork) {
+        try { this.store.deleteWork(meta); } catch (e) { console.error(`[swarmbase] run ${meta.id} work dir cleanup failed:`, e); }
       }
       this.active.delete(meta.id);
       try { this.listener.runEnded(meta); } catch (e) { console.error('[swarmbase] runEnded listener failed:', e); }

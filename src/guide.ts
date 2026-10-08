@@ -24,7 +24,8 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   - \`profile\` — what the subagent may touch. think: no tools. read: Read/Grep/Glob inside its cwd only,
     plus WebFetch/WebSearch. write: + Edit/Write inside its cwd, and Bash. Default read; your maximum is
     "${opts.maxProfile}".
-  - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir.
+  - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir, which is
+    deleted when the run ends (start the run with \`keepWork: true\` to keep it; \`resume\` gets a fresh one).
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.
   - \`timeoutMs\` — per-agent wall clock (default and cap 30 min).
   - \`maxUsd\` — this agent's spending cap (default max($0.50, budget/8)). The cap is reserved from the run budget

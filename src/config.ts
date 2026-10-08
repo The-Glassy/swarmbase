@@ -49,6 +49,9 @@ export interface Config {
   /** ANTHROPIC_BASE_URL for agents, e.g. an inference gateway. null = the vendor API. */
   apiBaseUrl: string | null;
   claudeBin: string;
+  /** Delete each run's `work/` (clones, toolchains, scratch) when the run ends, unless the run
+   *  was started with `keepWork`. Also sweeps the work dirs of ended runs on boot. Default true. */
+  deleteWorkOnEnd: boolean;
   /** Extra/override model price rows (USD per MTok) for estimating killed agents' spend. */
   prices?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; cacheWrite1h: number }>;
   dashboard: {
@@ -71,6 +74,7 @@ const DEFAULTS: Omit<Config, 'callers'> = {
   previewChars: 4000,
   apiBaseUrl: null,
   claudeBin: 'claude',
+  deleteWorkOnEnd: true,
   dashboard: { adminLogins: [] },
 };
 

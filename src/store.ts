@@ -12,7 +12,7 @@
  *   work/          default cwd for subagents
  */
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -45,6 +45,8 @@ export interface RunMeta {
   resumedFrom: string | null;
   error: string | null;
   resultChars: number | null;
+  /** Keep `work/` after the run ends (default: deleted, see Config.deleteWorkOnEnd). */
+  keepWork?: boolean;
 }
 
 export type RunEvent = { seq: number; ts: string } & (
@@ -108,7 +110,7 @@ export class RunStore {
     return [...this.metas.values()].filter((m) => m.status === 'running');
   }
 
-  create(input: { caller: string; label: string | null; script: string; args: unknown; defaults: AgentDefaults; budgetUsd: number; resumedFrom: string | null }): RunMeta {
+  create(input: { caller: string; label: string | null; script: string; args: unknown; defaults: AgentDefaults; budgetUsd: number; resumedFrom: string | null; keepWork?: boolean }): RunMeta {
     const id = newRunId();
     const dir = join(this.runsDir, `${stamp()}-${id}`);
     mkdirSync(join(dir, 'agents'), { recursive: true });
@@ -130,6 +132,7 @@ export class RunStore {
       currentPhase: null,
       phases: [],
       resumedFrom: input.resumedFrom,
+      ...(input.keepWork ? { keepWork: true } : {}),
       error: null,
       resultChars: null,
     };
@@ -261,5 +264,29 @@ export class RunStore {
 
   workDir(meta: RunMeta): string {
     return join(meta.dir, 'work');
+  }
+
+  /** Remove everything under the run's `work/` and leave the (empty) directory in place.
+   *  Only ever touches `<run dir>/work`. Returns false when nothing was there. */
+  deleteWork(meta: RunMeta): boolean {
+    const dir = this.workDir(meta);
+    if (!existsSync(dir)) return false;
+    let hadFiles = false;
+    for (const name of readdirSync(dir)) {
+      hadFiles = true;
+      rmSync(join(dir, name), { recursive: true, force: true });
+    }
+    return hadFiles;
+  }
+
+  /** Work dirs of runs that have ended and were not started with `keepWork`:
+   *  what a crash or an old build left behind. */
+  sweepWork(): RunMeta[] {
+    const out: RunMeta[] = [];
+    for (const meta of this.metas.values()) {
+      if (meta.status === 'running' || meta.keepWork) continue;
+      if (this.deleteWork(meta)) out.push(meta);
+    }
+    return out;
   }
 }
