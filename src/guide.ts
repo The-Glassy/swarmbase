@@ -19,18 +19,21 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   the run budget is spent, the agent cap is hit, or opts break policy.
   opts:
   - \`label\` — name shown on the dashboard.  \`phase\` — group it under a phase (use inside parallel/pipeline).
-  - \`schema\` — JSON Schema, \`{type:'object', properties:{...}, required:[...]}\` at the root.
+  - \`schema\` — JSON Schema, \`{type:'object', properties:{...}, required:[...]}\` at the root.${codex ? `
+    With engine "codex" the schema is strict: list every property in \`required\` (an optional field is a
+    nullable type, e.g. \`type: ['string', 'null']\`); \`additionalProperties: false\` is added for you.` : ''}
   - \`engine\` — ${codex ? '"claude" (default) or "codex": a Codex CLI subagent on a GPT model, with the same profiles' : 'only "claude" is available to you'}.
   - \`model\` — default "${opts.defaultModel}" (claude). Any Claude model id or alias (haiku | sonnet | opus).${codex ? `
     With engine "codex": default "${opts.defaultModels.codex}"; any model the Codex endpoint serves.` : ''}
   - \`effort\` — low | medium | high | xhigh | max (omit for the model default).${codex ? `
   - \`maxTokens\` — engine "codex" only: the agent's token ceiling (input + output over all its requests); it ends
-    as null when crossed. Codex agents are priced from the daemon's price table when it has a row for the model, else
-    they cost $0 against the run budget and the ceiling is their only limit.` : ''}
+    as null when crossed. Every request re-sends the whole context, so a one-command task is ~10k and a few tool
+    calls reach 50–100k; don't set it below ~50k. Codex agents are priced from the daemon's price table when it has a
+    row for the model, else they cost $0 against the run budget and the ceiling is their only limit.` : ''}
   - \`profile\` — what the subagent may touch. think: no tools. read: Read/Grep/Glob inside its cwd only,
     plus WebFetch/WebSearch. write: + Edit/Write inside its cwd, and Bash. Default read; your maximum is
     "${opts.maxProfile}".${codex ? ` For engine "codex": think = no tools; read = a read-only shell plus web search;
-    write = a shell that may write inside its cwd.` : ''}
+    write = a shell that may write inside its cwd. The read and write shells have network (git, curl).` : ''}
   - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir.
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.
   - \`timeoutMs\` — per-agent wall clock (default and cap 30 min).

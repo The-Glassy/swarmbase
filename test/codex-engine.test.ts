@@ -15,7 +15,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { parseConfig } from '../src/config.js';
 import { normalizeTranscript } from '../src/dashboard.js';
-import { binMounts, bwrapArgs, bwrapAvailable, buildArgs, denyPaths, renderConfig, runCodexAgent, type CodexAgentSpec } from '../src/engines/codex.js';
+import { binMounts, bwrapArgs, bwrapAvailable, buildArgs, denyPaths, renderConfig, runCodexAgent, strictSchema, type CodexAgentSpec } from '../src/engines/codex.js';
 import { parseUsage, UsageMeter } from '../src/meter.js';
 
 const caller = { name: 'r', tokenSha256: 'a'.repeat(64), apiKeyFile: '/tmp/x.key' };
@@ -71,6 +71,28 @@ test('rendered CODEX_HOME: profile selected by default_permissions, never -s; th
   assert.ok(denyPaths('/sb', '/w/home').includes(path.join(os.homedir(), '.ssh')));
 });
 
+test('renderConfig: read and write shells get network, think does not', () => {
+  const m = { baseUrl: 'http://127.0.0.1:1/m', bearer: 'sbm_x' };
+  for (const profile of ['read', 'write'] as const) {
+    const t = renderConfig(spec({ profile }), m);
+    assert.match(t, new RegExp(`\\[permissions\\.swarm-${profile}\\.network\\]\nenabled = true`), profile);
+  }
+  assert.doesNotMatch(renderConfig(spec({ profile: 'think' }), m), /swarm-think\.network/);
+});
+
+test('strictSchema: additionalProperties=false on every object, nothing else touched', () => {
+  const s = strictSchema({
+    type: 'object', properties: { ok: { type: 'boolean' }, items: { type: 'array', items: { type: 'object', properties: { n: { type: 'integer' } }, required: ['n'] } }, loose: { type: 'object', additionalProperties: true } },
+    required: ['ok', 'items', 'loose'], $defs: { d: { properties: { x: { type: 'string' } } } },
+  }) as any;
+  assert.equal(s.additionalProperties, false);
+  assert.equal(s.properties.items.items.additionalProperties, false);
+  assert.equal(s.properties.loose.additionalProperties, true, 'an explicit value is kept');
+  assert.equal(s.$defs.d.additionalProperties, false, 'properties without type counts as an object');
+  assert.deepEqual(s.required, ['ok', 'items', 'loose']);
+  assert.equal(s.properties.ok.additionalProperties, undefined);
+});
+
 test('outer bubblewrap: allow-list mounts, cwd writable only for write, env cleared', () => {
   const env = { PATH: '/usr/bin', HOME: '/w/home' };
   const ro = bwrapArgs(spec(), env);
@@ -121,7 +143,7 @@ test('parseUsage: SSE without content-type, JSON bodies, nothing for errors', ()
 
 // -- fake Responses backend ------------------------------------------------------
 interface Seen { path: string; headers: http.IncomingHttpHeaders; body: any }
-function fakeBackend(seen: Seen[]): http.Server {
+function fakeBackend(seen: Seen[], portOf?: () => number): http.Server {
   let n = 0;
   return http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -141,7 +163,8 @@ function fakeBackend(seen: Seen[]): http.Server {
     let output: any[];
     if (text.includes('USE-TOOL') && !hasToolOutput) {
       const toolName = (body.tools ?? []).some((t: any) => t.name === 'exec_command') ? 'exec_command' : 'shell';
-      const cmd = 'cat hello.txt; cat ../sb.key; cat ../secret/key.txt; ls ..';
+      const cmd = 'cat hello.txt; cat ../sb.key; cat ../secret/key.txt; ls ..'
+        + (portOf ? `; (exec 3<>/dev/tcp/127.0.0.1/${portOf()}) 2>/dev/null && echo NET-OK || echo NET-FAIL` : '');
       const args = toolName === 'exec_command' ? { cmd, yield_time_ms: 5000 } : { command: ['bash', '-lc', cmd] };
       const item = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: toolName, arguments: JSON.stringify(args) };
       output = [item];
@@ -217,8 +240,9 @@ const codexBin = findCodex();
 
 test('live: codex exec through the meter — isolation, schema, think profile, token ceiling', { skip: codexBin ? false : 'no codex CLI on this machine (set CODEX_BIN)' }, async () => {
   const seen: Seen[] = [];
-  const up = fakeBackend(seen);
-  const upPort = await listen(up);
+  let upPort = 0;
+  const up = fakeBackend(seen, () => upPort);
+  upPort = await listen(up);
   const meter = new UsageMeter();
   await meter.start();
   const sandbox = bwrapAvailable() ? 'bwrap' : 'none';
@@ -248,6 +272,7 @@ test('live: codex exec through the meter — isolation, schema, think profile, t
     const said = String(t.o.result);
     assert.match(said, /HELLO/);
     assert.doesNotMatch(said, /CANARY/, `a secret beside the workspace was readable (sandbox=${sandbox}): ${said}`);
+    assert.match(said, /NET-OK/, 'the read shell can open a TCP connection (network enabled in the profile)');
     assert.equal(t.o.tokens, 1460); // two responses of 730
     assert.equal(t.o.unpriced, true);
     assert.equal(t.o.costUsd, 0);
@@ -257,10 +282,11 @@ test('live: codex exec through the meter — isolation, schema, think profile, t
     assert.ok(fs.existsSync(path.join(runDir, 'agents', '1.jsonl')), 'the raw stream is kept');
     // 2. structured output
     seen.length = 0;
-    const s = await run(base(2, { prompt: 'SCHEMA', schema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false } }));
+    const s = await run(base(2, { prompt: 'SCHEMA', schema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] } }));
     assert.equal(s.o.ok, true, s.o.error ?? '');
     assert.deepEqual(s.o.result, { answer: 'yes' });
     assert.equal(seen[0].body.text?.format?.type, 'json_schema');
+    assert.equal(seen[0].body.text?.format?.schema?.additionalProperties, false, 'the engine made the schema strict');
     // 3. think: no tools offered to the model
     seen.length = 0;
     const th = await run(base(3, { prompt: 'think', profile: 'think' }));

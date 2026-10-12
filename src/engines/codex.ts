@@ -101,6 +101,28 @@ export function denyPaths(dataDir: string, homeDir: string): string[] {
   ];
 }
 
+/**
+ * The Responses API validates `--output-schema` as a strict schema: every object
+ * must carry `additionalProperties: false` (the claude engine never cared). Add
+ * it wherever a script's schema left it out, recursively, without touching
+ * anything else.
+ */
+export function strictSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(strictSchema);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    if (k === 'properties' || k === '$defs' || k === 'definitions') {
+      const sub: Record<string, unknown> = {};
+      for (const [name, def] of Object.entries((v ?? {}) as Record<string, unknown>)) sub[name] = strictSchema(def);
+      out[k] = sub;
+    } else out[k] = strictSchema(v);
+  }
+  const isObject = out.type === 'object' || (Array.isArray(out.type) && out.type.includes('object')) || ('properties' in out && out.type === undefined);
+  if (isObject && out.additionalProperties === undefined) out.additionalProperties = false;
+  return out;
+}
+
 /** The agent's CODEX_HOME/config.toml. */
 export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bearer: string }): string {
   const deny = denyPaths(spec.dataDir, spec.homeDir).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
@@ -146,12 +168,16 @@ export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bea
     '[permissions.swarm-read.filesystem]',
     '":workspace_roots" = "read"',
     deny,
+    '[permissions.swarm-read.network]',
+    'enabled = true',
     '',
     '[permissions.swarm-write]',
     'extends = ":workspace"',
     '[permissions.swarm-write.filesystem]',
     '":workspace_roots" = "write"',
     deny,
+    '[permissions.swarm-write.network]',
+    'enabled = true',
     '',
   ];
   return lines.join('\n');
@@ -235,7 +261,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   const started = Date.now();
   mkdirSync(join(spec.homeDir, 'tmp'), { recursive: true, mode: 0o700 });
   const schemaPath = spec.schema ? join(spec.homeDir, 'schema.json') : null;
-  if (schemaPath) writeFileSync(schemaPath, JSON.stringify(spec.schema));
+  if (schemaPath) writeFileSync(schemaPath, JSON.stringify(strictSchema(spec.schema)));
 
   // Usage accounting lives in the meter callback: it sees every response,
   // including the ones of an agent killed mid-turn.

@@ -127,7 +127,19 @@ Codex isolation differs from Claude Code's, and the engine compensates:
   since the wrapper loads its platform package from a sibling directory. Install `bubblewrap`, or set
   `"sandbox": "none"` to rely on the deny-list alone (trusted callers only).
 - Tools per profile: `think` = none; `read` = a read-only shell plus web search; `write` = a shell that may write
-  inside the cwd. Sub-agents, goals, image viewing and user-input requests are off in every profile.
+  inside the cwd. The `read` and `write` shells have network (`permissions.<profile>.network.enabled`; without it the
+  CLI's sandbox has none at all, not even DNS — the same reach as the claude engine's WebFetch and Bash). Sub-agents,
+  goals, image viewing and user-input requests are off in every profile.
+- `schema` is strict on this engine: the engine adds `additionalProperties: false` to every object; scripts must still
+  list every property in `required` (optional = nullable type).
+- `maxTokens` counts every request's full context, so a one-command task is ~10k tokens; keep the ceiling ≥ 50k.
+
+Deploying the codex engine, in order: the caller's key file holds a gateway token valid on the codex leg (and on
+the anthropic leg, if the caller also runs claude agents); `@openai/codex` installed with its platform package
+(`codex --version` works as the daemon's user); `bubblewrap` installed; if `engines.codex.baseUrl` is signed by a
+private CA, start the daemon with `NODE_EXTRA_CA_CERTS=<ca.pem>` — the meter's outbound TLS uses Node's trust store,
+and the CLI itself only ever talks plain HTTP to the meter on loopback. A certificate failure surfaces on the agent
+as `meter: upstream unable to verify the first certificate` with that hint.
 
 ## Profiles (what a subagent may touch)
 
@@ -179,9 +191,9 @@ open to the tailnet. Cancel and skip require a `Tailscale-User-Login` listed in 
 ## Known limits
 
 - There's no per-caller model allowlist.
-- Codex agents: the inner sandbox's network is whatever the CLI allows (the outer wrapper shares the host network, which
-  the CLI needs to reach the meter). A `think` codex agent still gets the CLI's own system prompt, which describes a
-  coding assistant.
+- Codex agents: the outer wrapper shares the host network (the CLI needs it to reach the meter), and the read/write
+  shells get direct network with no domain rules. A `think` codex agent still gets the CLI's own system prompt, which
+  describes a coding assistant.
 - An aborted stream is metered from what was streamed before the abort.
 - `isolation: 'worktree'` and `workflow()` nesting aren't implemented and fail loudly.
 - The runner sandbox is defense in depth. Node 20's permission model doesn't restrict network.

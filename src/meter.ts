@@ -124,7 +124,11 @@ export class UsageMeter {
     up.on('error', (e) => {
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: `meter: upstream ${e.message}`, type: 'bad_gateway' } }));
+        const code = (e as NodeJS.ErrnoException).code ?? '';
+        const hint = /CERT|SELF_SIGNED|UNABLE_TO_VERIFY|UNABLE_TO_GET_ISSUER|ALTNAME/.test(code + ' ' + e.message)
+          ? ' (the endpoint\'s certificate is not in this daemon\'s trust store — a private CA needs NODE_EXTRA_CA_CERTS=<ca.pem> in the daemon\'s environment)'
+          : '';
+        res.end(JSON.stringify({ error: { message: `meter: upstream ${e.message}${hint}`, type: 'bad_gateway' } }));
       } else {
         try { res.destroy(); } catch { /* gone */ }
       }
