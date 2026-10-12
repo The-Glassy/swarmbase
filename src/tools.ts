@@ -23,7 +23,7 @@ export class SwarmTools implements ToolHost {
   toolDefinitions(): unknown[] {
     const runProps = {
       label: { type: 'string', description: 'Short name for the dashboard and the completion notice.' },
-      model: { type: 'string', description: 'Default model for this run\'s agents (agent() opts override).' },
+      model: { type: 'string', description: 'Default Claude model for this run\'s claude-engine agents (agent() opts override; codex agents use the caller\'s codex default).' },
       effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'Default effort for this run\'s agents.' },
       profile: { type: 'string', enum: [...PROFILES], description: 'Default tool profile: think (no tools) | read | write.' },
       budgetUsd: { type: 'number', description: 'Hard USD ceiling for the run; agent() throws once it is spent.' },
@@ -109,6 +109,8 @@ export class SwarmTools implements ToolHost {
         case 'list': return this.list(caller, args);
         case 'guide': return text(guideText({
           defaultModel: caller.defaultModel,
+          engines: caller.engines,
+          defaultModels: caller.defaultModels,
           maxProfile: caller.maxProfile,
           budgetDefault: caller.runUsdDefault,
           budgetMax: caller.runUsdMax,

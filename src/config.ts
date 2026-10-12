@@ -10,8 +10,31 @@ import { join, resolve, sep } from 'node:path';
 
 export type Profile = 'think' | 'read' | 'write';
 export const PROFILES: readonly Profile[] = ['think', 'read', 'write'];
-export type EngineName = 'claude';
-export const ENGINES: readonly EngineName[] = ['claude'];
+export type EngineName = 'claude' | 'codex';
+export const ENGINES: readonly EngineName[] = ['claude', 'codex'];
+
+export interface ClaudeEngineConfig {
+  /** The Claude Code CLI. */
+  bin: string;
+  /** ANTHROPIC_BASE_URL for agents, e.g. `https://<gateway>/anthropic`. null = the vendor API. */
+  baseUrl: string | null;
+}
+
+export interface CodexEngineConfig {
+  /** The Codex CLI. */
+  bin: string;
+  /** Responses-API endpoint the agents run against, e.g. `https://<gateway>/codex`.
+   *  null = the engine is not offered (there is no vendor default: the CLI's own
+   *  login mode would use the operator's ChatGPT account). */
+  baseUrl: string | null;
+  /** OS-level confinement around the CLI: `bwrap` (an allow-list of mounts; the
+   *  default when bubblewrap is on PATH) or `none` (the CLI's own deny-list only). */
+  sandbox: 'bwrap' | 'none';
+  /** Default per-agent token ceiling (input + output over the agent's requests). */
+  maxTokensDefault: number;
+  /** Extra read-only paths mounted into the wrapper (a CA bundle, a toolchain). */
+  extraRoBinds: string[];
+}
 
 export interface CallerPolicy {
   /** Stable identity (resident name). Runs are owned by it. */
@@ -25,6 +48,9 @@ export interface CallerPolicy {
   maxProfile: Profile;
   /** Absolute directories a subagent `cwd` may sit under. Default cwd = the run's own work dir. */
   cwdRoots: string[];
+  /** Default model per engine when neither the run nor the agent() call names one. */
+  defaultModels: Record<EngineName, string>;
+  /** @deprecated alias of defaultModels.claude */
   defaultModel: string;
   /** Default per-run USD ceiling when `run` doesn't name one. */
   runUsdDefault: number;
@@ -46,10 +72,13 @@ export interface Config {
   runTimeoutMs: number;
   /** Chars of the return value inlined into the completion push. */
   previewChars: number;
-  /** ANTHROPIC_BASE_URL for agents, e.g. an inference gateway. null = the vendor API. */
-  apiBaseUrl: string | null;
-  claudeBin: string;
-  /** Extra/override model price rows (USD per MTok) for estimating killed agents' spend. */
+  engines: { claude: ClaudeEngineConfig; codex: CodexEngineConfig };
+  /** @deprecated use engines.claude.baseUrl */
+  apiBaseUrl?: string | null;
+  /** @deprecated use engines.claude.bin */
+  claudeBin?: string;
+  /** Extra/override model price rows (USD per MTok) for estimating killed agents' spend
+   *  (and all of a codex agent's spend: the Codex CLI reports tokens, not cost). */
   prices?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; cacheWrite1h: number }>;
   dashboard: {
     /** Tailscale logins (Tailscale-User-Login header) allowed to cancel/skip. */
@@ -57,6 +86,8 @@ export interface Config {
   };
   callers: CallerPolicy[];
 }
+
+export const DEFAULT_MODELS: Record<EngineName, string> = { claude: 'claude-sonnet-5-5', codex: 'gpt-6-astra' };
 
 const DEFAULTS: Omit<Config, 'callers'> = {
   host: '127.0.0.1',
@@ -69,8 +100,10 @@ const DEFAULTS: Omit<Config, 'callers'> = {
   agentTimeoutMs: 30 * 60_000,
   runTimeoutMs: 6 * 60 * 60_000,
   previewChars: 4000,
-  apiBaseUrl: null,
-  claudeBin: 'claude',
+  engines: {
+    claude: { bin: 'claude', baseUrl: null },
+    codex: { bin: 'codex', baseUrl: null, sandbox: 'bwrap', maxTokensDefault: 3_000_000, extraRoBinds: [] },
+  },
   dashboard: { adminLogins: [] },
 };
 
@@ -79,18 +112,38 @@ function expand(p: string): string {
 }
 
 export function loadConfig(path = process.env.SWARMBASE_CONFIG ?? join(homedir(), '.swarmbase', 'config.json')): Config {
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<Config>;
+  return parseConfig(JSON.parse(readFileSync(path, 'utf8')) as Partial<Config>);
+}
+
+export function parseConfig(raw: Partial<Config>): Config {
+  const rawEngines = (raw.engines ?? {}) as Partial<Config['engines']>;
+  const claude: ClaudeEngineConfig = {
+    ...DEFAULTS.engines.claude,
+    ...(raw.claudeBin !== undefined ? { bin: raw.claudeBin } : {}),
+    ...(raw.apiBaseUrl !== undefined ? { baseUrl: raw.apiBaseUrl } : {}),
+    ...(rawEngines.claude ?? {}),
+  };
+  const codex: CodexEngineConfig = { ...DEFAULTS.engines.codex, ...(rawEngines.codex ?? {}) };
+  if (codex.sandbox !== 'bwrap' && codex.sandbox !== 'none') throw new Error(`config: engines.codex.sandbox must be "bwrap" or "none"`);
+  if (!(Number(codex.maxTokensDefault) > 0)) throw new Error('config: engines.codex.maxTokensDefault must be a positive number');
+  codex.extraRoBinds = (codex.extraRoBinds ?? []).map((p) => resolve(expand(String(p))));
   const cfg: Config = {
     ...DEFAULTS,
     ...raw,
+    engines: { claude, codex },
     dashboard: { ...DEFAULTS.dashboard, ...(raw.dashboard ?? {}) },
     callers: (raw.callers ?? []).map(validateCaller),
   };
+  cfg.apiBaseUrl = claude.baseUrl;
+  cfg.claudeBin = claude.bin;
   cfg.dataDir = expand(cfg.dataDir);
   const names = new Set<string>();
   for (const c of cfg.callers) {
     if (names.has(c.name)) throw new Error(`config: duplicate caller "${c.name}"`);
     names.add(c.name);
+    if (c.engines.includes('codex') && !codex.baseUrl) {
+      throw new Error(`config: caller ${c.name} lists the codex engine but engines.codex.baseUrl is not set`);
+    }
   }
   return cfg;
 }
@@ -101,7 +154,14 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   if (!c.apiKeyFile) throw new Error(`config: caller ${c.name} needs apiKeyFile`);
   const maxProfile = c.maxProfile ?? 'read';
   if (!PROFILES.includes(maxProfile)) throw new Error(`config: caller ${c.name} bad maxProfile ${maxProfile}`);
-  const engines = (c.engines ?? ['claude']).filter((e): e is EngineName => ENGINES.includes(e as EngineName));
+  const engines = c.engines ?? ['claude'];
+  for (const e of engines) if (!ENGINES.includes(e)) throw new Error(`config: caller ${c.name} unknown engine ${JSON.stringify(e)} (${ENGINES.join(' | ')})`);
+  if (!engines.length) throw new Error(`config: caller ${c.name} lists no engines`);
+  const defaultModels: Record<EngineName, string> = {
+    ...DEFAULT_MODELS,
+    ...(c.defaultModel ? { claude: c.defaultModel } : {}),
+    ...(c.defaultModels ?? {}),
+  };
   return {
     name: c.name,
     tokenSha256: c.tokenSha256,
@@ -109,7 +169,8 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
     engines,
     maxProfile,
     cwdRoots: (c.cwdRoots ?? []).map((r) => resolve(expand(r))),
-    defaultModel: c.defaultModel ?? 'claude-sonnet-5-5',
+    defaultModels,
+    defaultModel: defaultModels.claude,
     runUsdDefault: c.runUsdDefault ?? 5,
     runUsdMax: c.runUsdMax ?? 25,
     maxActiveRuns: c.maxActiveRuns ?? 3,

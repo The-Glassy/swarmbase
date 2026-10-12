@@ -259,6 +259,11 @@ export class RunStore {
     return join(meta.dir, 'agents', `${n}.jsonl`);
   }
 
+  /** Throwaway home dir (CODEX_HOME) for an engine that keeps state on disk; the engine deletes it. */
+  agentHomeDir(meta: RunMeta, n: number): string {
+    return join(meta.dir, 'agents', `${n}-home`);
+  }
+
   workDir(meta: RunMeta): string {
     return join(meta.dir, 'work');
   }

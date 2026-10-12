@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { isUnder, profileRank, type CallerPolicy, type Config, type EngineName, type Profile } from './config.js';
 import { killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome } from './engines/claude.js';
+import { runCodexAgent } from './engines/codex.js';
+import type { UsageMeter } from './meter.js';
 import { Semaphore } from './semaphore.js';
 import type { AgentDefaults, AgentStatus, RunMeta, RunStatus, RunStore } from './store.js';
 import { wrapScript } from './runner/wrap.js';
@@ -83,6 +85,7 @@ interface ResolvedAgent {
   cwd: string;
   timeoutMs: number;
   maxUsd: number | null;
+  maxTokens: number;
   warnings: string[];
 }
 
@@ -95,6 +98,8 @@ export class RunManager {
     private readonly store: RunStore,
     private readonly emptyMcpConfigPath: string,
     private readonly listener: RunEndListener,
+    /** null = the codex engine is not configured */
+    private readonly meter: UsageMeter | null = null,
   ) {
     this.globalSem = new Semaphore(cfg.maxConcurrentAgents);
   }
@@ -343,13 +348,15 @@ export class RunManager {
 
     const engine = (opts.engine ?? 'claude') as EngineName;
     if (!caller.engines.includes(engine)) throw new Error(`engine "${opts.engine}" is not available to you (available: ${caller.engines.join(', ')})`);
+    if (engine === 'codex' && !this.meter) throw new Error('engine "codex" is not configured on this SwarmBase');
 
     const defaultProfile: Profile = profileRank(caller.maxProfile) >= profileRank('read') ? 'read' : caller.maxProfile;
     const profile = (opts.profile ?? d.profile ?? defaultProfile) as Profile;
     if (!['think', 'read', 'write'].includes(profile)) throw new Error(`unknown profile "${profile}" (think | read | write)`);
     if (profileRank(profile) > profileRank(caller.maxProfile)) throw new Error(`profile "${profile}" exceeds your maximum "${caller.maxProfile}"`);
 
-    const model = String(opts.model ?? d.model ?? caller.defaultModel);
+    // the run-level default model is an engine-specific id, so it applies to the default engine only
+    const model = String(opts.model ?? (engine === 'claude' ? d.model : undefined) ?? caller.defaultModels[engine]);
     if (!MODEL_RE.test(model)) throw new Error(`bad model id ${JSON.stringify(model)}`);
 
     const effortRaw = opts.effort ?? d.effort ?? null;
@@ -386,10 +393,17 @@ export class RunManager {
       maxUsd = v;
     }
 
+    let maxTokens = this.cfg.engines.codex.maxTokensDefault;
+    if (opts.maxTokens !== undefined) {
+      const v = Number(opts.maxTokens);
+      if (!Number.isInteger(v) || v <= 0) throw new Error('maxTokens must be a positive integer');
+      maxTokens = v;
+    }
+
     const timeoutMs = Math.min(this.cfg.agentTimeoutMs, Math.max(10_000, Number(opts.timeoutMs ?? this.cfg.agentTimeoutMs) || this.cfg.agentTimeoutMs));
     const label = typeof opts.label === 'string' && opts.label.trim() ? opts.label.trim().slice(0, 80) : `agent-${n}`;
     const phase = typeof opts.phase === 'string' ? opts.phase.slice(0, 120) : run.meta.currentPhase;
-    return { label, phase, schema, model, effort, profile, engine, cwd, timeoutMs, maxUsd, warnings };
+    return { label, phase, schema, model, effort, profile, engine, cwd, timeoutMs, maxUsd, maxTokens, warnings };
   }
 
   private available(run: ActiveRun): number {
@@ -523,25 +537,32 @@ export class RunManager {
 
     let outcome: AgentOutcome;
     try {
-      outcome = await runClaudeAgent({
-        runId: meta.id,
-        n,
-        label: a.label,
-        prompt,
-        schema: a.schema,
-        model: a.model,
-        effort: a.effort,
-        profile: a.profile,
-        cwd: a.cwd,
-        timeoutMs: a.timeoutMs,
-        maxBudgetUsd: reserved,
-        streamPath: this.store.agentStreamPath(meta, n),
-        apiKey: readApiKey(run.caller.apiKeyFile),
-        apiBaseUrl: this.cfg.apiBaseUrl,
-        claudeBin: this.cfg.claudeBin,
-        emptyMcpConfigPath: this.emptyMcpConfigPath,
-        dataDir: realpathSync(this.cfg.dataDir),
-      }, slot.ac.signal, onActivity);
+      const common = {
+        runId: meta.id, n, label: a.label, prompt, schema: a.schema, model: a.model, effort: a.effort, profile: a.profile,
+        cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved, streamPath: this.store.agentStreamPath(meta, n),
+        apiKey: readApiKey(run.caller.apiKeyFile), dataDir: realpathSync(this.cfg.dataDir),
+      };
+      if (a.engine === 'codex') {
+        const codex = this.cfg.engines.codex;
+        const o = await runCodexAgent({
+          ...common,
+          maxTokens: a.maxTokens,
+          homeDir: this.store.agentHomeDir(meta, n),
+          baseUrl: codex.baseUrl!,
+          codexBin: codex.bin,
+          sandbox: codex.sandbox,
+          extraRoBinds: codex.extraRoBinds,
+        }, this.meter!, slot.ac.signal, onActivity);
+        if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 (set config.prices to shadow-price it)` });
+        outcome = o;
+      } else {
+        outcome = await runClaudeAgent({
+          ...common,
+          apiBaseUrl: this.cfg.engines.claude.baseUrl,
+          claudeBin: this.cfg.engines.claude.bin,
+          emptyMcpConfigPath: this.emptyMcpConfigPath,
+        }, slot.ac.signal, onActivity);
+      }
     } catch (e) {
       outcome = { ok: false, result: null, costUsd: 0, durationMs: 0, usage: null, error: (e as Error).message, reason: 'exit' };
     } finally {
@@ -560,6 +581,7 @@ export class RunManager {
     if (outcome.ok) this.store.appendJournal(meta, { key, n, label: a.label, result: outcome.result, costUsd: outcome.costUsd });
     let error = slot.skipped ? 'skipped by operator' : (outcome.error ?? 'failed');
     if (!outcome.ok && /max_budget/.test(error)) error = `hit its $${reserved.toFixed(2)} cap (raise opts.maxUsd or the run budget) — ${error}`;
+    if (!outcome.ok && outcome.reason === 'token-ceiling') error = `hit its token ceiling (raise opts.maxTokens) — ${error}`;
     this.store.emit(meta.id, {
       type: 'agent_end', n, status, costUsd: outcome.costUsd, durationMs: outcome.durationMs,
       usage: outcome.usage ?? undefined,

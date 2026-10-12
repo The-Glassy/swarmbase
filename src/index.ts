@@ -14,6 +14,8 @@ import { WebSocketServer } from 'ws';
 import { loadConfig } from './config.js';
 import { createDashboard } from './dashboard.js';
 import { addPrices, ensureEmptyMcpConfig, initLiveGroups } from './engines/claude.js';
+import { bwrapAvailable } from './engines/codex.js';
+import { UsageMeter } from './meter.js';
 import { join } from 'node:path';
 import { Notifier } from './notifier.js';
 import { RunManager } from './runs.js';
@@ -32,7 +34,16 @@ async function main(): Promise<void> {
   initLiveGroups(join(cfg.dataDir, 'live-agents.json'), log); // reap a crashed predecessor's agents
   const store = new RunStore(cfg.dataDir);
   const notifier = new Notifier(cfg, store);
-  const runs = new RunManager(cfg, store, ensureEmptyMcpConfig(cfg.dataDir), notifier);
+  let meter: UsageMeter | null = null;
+  if (cfg.engines.codex.baseUrl) {
+    if (cfg.engines.codex.sandbox === 'bwrap' && !bwrapAvailable()) {
+      throw new Error('engines.codex.sandbox is "bwrap" but bubblewrap (bwrap) is not on PATH: install it, or set sandbox to "none" (the CLI\'s own deny-list only)');
+    }
+    meter = new UsageMeter();
+    await meter.start();
+    log(`codex engine on (${cfg.engines.codex.sandbox === 'bwrap' ? 'bubblewrap wrapper' : 'NO OS wrapper: the CLI deny-list is the only read barrier'})`);
+  }
+  const runs = new RunManager(cfg, store, ensureEmptyMcpConfig(cfg.dataDir), notifier, meter);
   for (const meta of runs.markOrphansInterrupted()) {
     log(`run ${meta.id} (${meta.caller}) was in flight at last shutdown → interrupted`);
     notifier.runEnded(meta);
@@ -74,6 +85,7 @@ async function main(): Promise<void> {
     stopping = true;
     log(`${sig}: stopping agents; in-flight runs will be marked interrupted on next start`);
     runs.shutdown();
+    void meter?.stop();
     for (const c of wss.clients) c.terminate();
     http.close();
     setTimeout(() => process.exit(0), 1500).unref();

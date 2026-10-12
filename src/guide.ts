@@ -1,5 +1,6 @@
 /** The authoring reference handed to callers by the `guide` tool. */
-export function guideText(opts: { defaultModel: string; maxProfile: string; budgetDefault: number; budgetMax: number; maxAgents: number; perRun: number; cwdRoots: string[] }): string {
+export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; maxAgents: number; perRun: number; cwdRoots: string[] }): string {
+  const codex = opts.engines.includes('codex');
   return `# SwarmBase — writing a run
 
 A run is a JavaScript script that orchestrates subagents. You submit it with \`run\`; it returns a runId at once and
@@ -19,11 +20,17 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   opts:
   - \`label\` — name shown on the dashboard.  \`phase\` — group it under a phase (use inside parallel/pipeline).
   - \`schema\` — JSON Schema, \`{type:'object', properties:{...}, required:[...]}\` at the root.
-  - \`model\` — default "${opts.defaultModel}". Any Claude model id or alias (haiku | sonnet | opus).
-  - \`effort\` — low | medium | high | xhigh | max (omit for the model default).
+  - \`engine\` — ${codex ? '"claude" (default) or "codex": a Codex CLI subagent on a GPT model, with the same profiles' : 'only "claude" is available to you'}.
+  - \`model\` — default "${opts.defaultModel}" (claude). Any Claude model id or alias (haiku | sonnet | opus).${codex ? `
+    With engine "codex": default "${opts.defaultModels.codex}"; any model the Codex endpoint serves.` : ''}
+  - \`effort\` — low | medium | high | xhigh | max (omit for the model default).${codex ? `
+  - \`maxTokens\` — engine "codex" only: the agent's token ceiling (input + output over all its requests); it ends
+    as null when crossed. Codex agents are priced from the daemon's price table when it has a row for the model, else
+    they cost $0 against the run budget and the ceiling is their only limit.` : ''}
   - \`profile\` — what the subagent may touch. think: no tools. read: Read/Grep/Glob inside its cwd only,
     plus WebFetch/WebSearch. write: + Edit/Write inside its cwd, and Bash. Default read; your maximum is
-    "${opts.maxProfile}".
+    "${opts.maxProfile}".${codex ? ` For engine "codex": think = no tools; read = a read-only shell plus web search;
+    write = a shell that may write inside its cwd.` : ''}
   - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir.
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.
   - \`timeoutMs\` — per-agent wall clock (default and cap 30 min).
@@ -53,7 +60,7 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
 ## Resume
 Every non-null agent result is journaled. \`resume\` starts a new run (same script unless you pass an edited one)
 whose agent() calls are answered from that journal when the call matches exactly (prompt + schema + model +
-effort + profile + cwd), so only new or changed calls cost anything. Use it after a failure, a cancel, a daemon
+effort + profile + engine + cwd), so only new or changed calls cost anything. Use it after a failure, a cancel, a daemon
 restart, or to iterate on a script.
 
 ## Patterns
