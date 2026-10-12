@@ -15,7 +15,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { parseConfig } from '../src/config.js';
 import { normalizeTranscript } from '../src/dashboard.js';
-import { bwrapArgs, bwrapAvailable, buildArgs, denyPaths, renderConfig, runCodexAgent, type CodexAgentSpec } from '../src/engines/codex.js';
+import { binMounts, bwrapArgs, bwrapAvailable, buildArgs, denyPaths, renderConfig, runCodexAgent, type CodexAgentSpec } from '../src/engines/codex.js';
 import { parseUsage, UsageMeter } from '../src/meter.js';
 
 const caller = { name: 'r', tokenSha256: 'a'.repeat(64), apiKeyFile: '/tmp/x.key' };
@@ -86,6 +86,29 @@ test('outer bubblewrap: allow-list mounts, cwd writable only for write, env clea
   assert.ok(rw.join(' ').includes('--bind /w/work /w/work'));
   assert.ok(rw.join(' ').includes('--ro-bind-try /opt/ca /opt/ca'));
   assert.ok(!rw.includes('/sb'), 'the data dir is not mounted');
+});
+
+test('outer bubblewrap: an npm-installed codex gets its node_modules tree and bin symlink dir', () => {
+  // ~/.nvm-style layout: bin/codex -> ../lib/node_modules/@openai/codex/bin/codex.js,
+  // with the platform package as a sibling the wrapper finds via require.resolve.
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-npm-'));
+  const pkg = path.join(prefix, 'lib', 'node_modules', '@openai', 'codex', 'bin');
+  fs.mkdirSync(pkg, { recursive: true });
+  fs.mkdirSync(path.join(prefix, 'lib', 'node_modules', '@openai', 'codex-linux-x64', 'vendor'), { recursive: true });
+  fs.writeFileSync(path.join(pkg, 'codex.js'), '#!/usr/bin/env node\n');
+  fs.mkdirSync(path.join(prefix, 'bin'));
+  fs.symlinkSync('../lib/node_modules/@openai/codex/bin/codex.js', path.join(prefix, 'bin', 'codex'));
+  try {
+    const mounts = binMounts([path.join(prefix, 'bin', 'codex'), '/usr/bin/node']);
+    assert.deepEqual(new Set(mounts), new Set([path.join(prefix, 'bin'), path.join(prefix, 'lib', 'node_modules')]), 'symlink dir + the whole node_modules tree, nothing under /usr');
+    const args = bwrapArgs(spec({ codexBin: path.join(prefix, 'bin', 'codex') }), { PATH: '/usr/bin' });
+    const a = args.join(' ');
+    assert.ok(a.includes(`--ro-bind-try ${path.join(prefix, 'lib', 'node_modules')} ${path.join(prefix, 'lib', 'node_modules')}`));
+    assert.ok(a.includes(`--ro-bind-try ${path.join(prefix, 'bin')} ${path.join(prefix, 'bin')}`));
+    assert.ok(a.endsWith(`-- ${path.join(prefix, 'bin', 'codex')}`));
+  } finally {
+    fs.rmSync(prefix, { recursive: true, force: true });
+  }
 });
 
 test('parseUsage: SSE without content-type, JSON bodies, nothing for errors', () => {

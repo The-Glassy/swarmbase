@@ -172,6 +172,33 @@ function roBindTry(p: string): string[] {
   return ['--ro-bind-try', p, p];
 }
 
+/**
+ * Directories a binary needs mounted to run: the directory it was named by
+ * (a symlink, for an npm-installed CLI), the one its real file lives in, and
+ * — when the real file sits under a `node_modules` tree — that whole tree, so
+ * `require.resolve` finds the package's siblings (the `@openai/codex` wrapper
+ * loads its platform package `@openai/codex-linux-x64` that way). Anything
+ * under /usr is already mounted.
+ */
+export function binMounts(bins: string[]): string[] {
+  const dirs = new Set<string>();
+  for (const b of bins) {
+    dirs.add(dirname(b));
+    let real: string;
+    try { real = realpathSync(b); } catch { continue; } // resolved by PATH inside
+    dirs.add(dirname(real));
+    const nm = real.indexOf('/node_modules/');
+    if (nm > 0) dirs.add(real.slice(0, nm + '/node_modules'.length));
+  }
+  const out: string[] = [];
+  for (const d of dirs) {
+    if (d.startsWith('/usr/') || d === '/usr') continue;
+    if ([...dirs].some((o) => o !== d && d.startsWith(o + '/'))) continue; // already inside another mount
+    out.push(d);
+  }
+  return out;
+}
+
 /** The outer bubblewrap allow-list. */
 export function bwrapArgs(spec: CodexAgentSpec, env: Record<string, string>): string[] {
   const args = ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--die-with-parent', '--new-session', '--ro-bind', '/usr', '/usr'];
@@ -184,11 +211,7 @@ export function bwrapArgs(spec: CodexAgentSpec, env: Record<string, string>): st
     args.push(...roBindTry(f));
   }
   args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp');
-  const binDirs = new Set<string>();
-  for (const b of [spec.codexBin, process.execPath]) {
-    try { binDirs.add(dirname(realpathSync(b))); } catch { /* resolved by PATH inside */ }
-  }
-  for (const d of binDirs) if (!d.startsWith('/usr/')) args.push(...roBindTry(d));
+  for (const d of binMounts([spec.codexBin, process.execPath])) args.push(...roBindTry(d));
   for (const p of spec.extraRoBinds) args.push(...roBindTry(p));
   args.push('--bind', spec.homeDir, spec.homeDir);
   args.push(spec.profile === 'write' ? '--bind' : '--ro-bind', spec.cwd, spec.cwd);
@@ -247,8 +270,12 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
 
   writeFileSync(join(spec.homeDir, 'config.toml'), renderConfig(spec, slot), { mode: 0o600 });
 
+  // The daemon's own node goes first on PATH: an npm-installed codex is a
+  // `#!/usr/bin/env node` script, and inside the sandbox only what we mount exists.
+  const nodeDir = dirname(process.execPath);
+  const basePath = process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin';
   const env: Record<string, string> = {
-    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+    PATH: basePath.split(':').includes(nodeDir) ? basePath : `${nodeDir}:${basePath}`,
     HOME: spec.homeDir,
     CODEX_HOME: spec.homeDir,
     TMPDIR: join(spec.homeDir, 'tmp'),

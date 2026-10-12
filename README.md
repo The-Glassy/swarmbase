@@ -121,8 +121,11 @@ Codex isolation differs from Claude Code's, and the engine compensates:
   credential dirs, selects it with `default_permissions`, and never passes `-s`.
 - By default (`engines.codex.sandbox: "bwrap"`) the whole CLI runs inside an **outer bubblewrap allow-list**: `/usr`
   (+ `/lib`, `/bin` …), a few `/etc` files, the agent's cwd (read-only unless the profile is `write`) and its
-  throwaway `CODEX_HOME`; nothing else exists in its namespace, and the CLI's inner sandbox nests inside. Install
-  `bubblewrap`, or set `"sandbox": "none"` to rely on the deny-list alone (trusted callers only).
+  throwaway `CODEX_HOME`; nothing else exists in its namespace, and the CLI's inner sandbox nests inside. The
+  directories of `engines.codex.bin` and of the daemon's own `node` are mounted read-only too, and for an
+  npm-installed CLI (`bin/codex` → `lib/node_modules/@openai/codex/bin/codex.js`) the whole `node_modules` tree,
+  since the wrapper loads its platform package from a sibling directory. Install `bubblewrap`, or set
+  `"sandbox": "none"` to rely on the deny-list alone (trusted callers only).
 - Tools per profile: `think` = none; `read` = a read-only shell plus web search; `write` = a shell that may write
   inside the cwd. Sub-agents, goals, image viewing and user-input requests are off in every profile.
 
