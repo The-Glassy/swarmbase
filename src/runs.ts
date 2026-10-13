@@ -9,6 +9,9 @@
  * that can't get even a minimum reservation waits while others hold
  * reservations, and agent() throws once nothing is left. Overshoot is bounded
  * by one model turn per running agent (the CLI checks its cap per turn).
+ * Codex agents reserve their token ceiling from the run's token budget the
+ * same way (their USD spend is $0 without a price row, so the USD budget
+ * alone would not bound them).
  */
 import { fork, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -18,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { isUnder, profileRank, type CallerPolicy, type Config, type EngineName, type Profile } from './config.js';
 import { killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome } from './engines/claude.js';
-import { runCodexAgent } from './engines/codex.js';
+import { runCodexAgent, strictSchemaProblem } from './engines/codex.js';
 import type { UsageMeter } from './meter.js';
 import { Semaphore } from './semaphore.js';
 import type { AgentDefaults, AgentStatus, RunMeta, RunStatus, RunStore } from './store.js';
@@ -29,6 +32,9 @@ const PKG_ROOT = resolve(dirname(RUNNER_PATH), '../../..');
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const MODEL_RE = /^[A-Za-z0-9._:@/\[\]-]{1,100}$/;
 const MIN_AGENT_USD = 0.03;
+/** Smallest token reservation worth starting a codex agent on (one request re-sends the whole context). */
+const MIN_AGENT_TOKENS = 20_000;
+const CODEX_EFFORTS: Record<string, string> = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'xhigh' };
 const MAX_LOG_EVENTS = 2000;
 const MAX_PHASES = 100;
 const WATCHDOG_INTERVAL_MS = 30_000;
@@ -55,6 +61,7 @@ interface ActiveRun {
   runSem: Semaphore;
   agentSeq: number;
   reservedUsd: number;
+  reservedTokens: number;
   budgetWaiters: Set<() => void>;
   logCount: number;
   ending: boolean;
@@ -71,6 +78,7 @@ export interface StartRunInput {
   label: string | null;
   defaults: AgentDefaults;
   budgetUsd: number;
+  budgetTokens: number;
   resumeFrom: string | null;
 }
 
@@ -136,9 +144,10 @@ export class RunManager {
       args: input.args,
       defaults: input.defaults,
       budgetUsd: input.budgetUsd,
+      budgetTokens: input.budgetTokens,
       resumedFrom: input.resumeFrom,
     });
-    this.store.emit(meta.id, { type: 'run_start', caller: meta.caller, label: meta.label, budgetUsd: meta.budgetUsd, resumedFrom: meta.resumedFrom });
+    this.store.emit(meta.id, { type: 'run_start', caller: meta.caller, label: meta.label, budgetUsd: meta.budgetUsd, budgetTokens: meta.budgetTokens, resumedFrom: meta.resumedFrom });
 
     const child = fork(RUNNER_PATH, [], {
       execArgv: ['--experimental-permission', `--allow-fs-read=${PKG_ROOT}/*`, '--no-warnings'],
@@ -156,6 +165,7 @@ export class RunManager {
       runSem: new Semaphore(this.cfg.perRunConcurrency),
       agentSeq: 0,
       reservedUsd: 0,
+      reservedTokens: 0,
       budgetWaiters: new Set(),
       logCount: 0,
       ending: false,
@@ -228,7 +238,8 @@ export class RunManager {
       meta.counts.running = 0;
       meta.counts.queued = 0;
       this.store.saveMeta(meta);
-      this.store.emit(meta.id, { type: 'run_end', status: 'interrupted', spentUsd: meta.spentUsd, error: meta.error });
+      this.store.emit(meta.id, { type: 'run_end', status: 'interrupted', spentUsd: meta.spentUsd, spentTokens: meta.spentTokens, error: meta.error });
+      this.store.sweepAgentHomes(meta); // codex homes its agents never got to delete
       out.push(meta);
     }
     return out;
@@ -324,7 +335,7 @@ export class RunManager {
         meta.error = error;
         meta.endedAt = new Date().toISOString();
         this.store.saveMeta(meta);
-        this.store.emit(meta.id, { type: 'run_end', status, spentUsd: meta.spentUsd, error });
+        this.store.emit(meta.id, { type: 'run_end', status, spentUsd: meta.spentUsd, spentTokens: meta.spentTokens, error });
       } catch (e) {
         console.error(`[swarmbase] run ${meta.id} final bookkeeping failed:`, e);
       }
@@ -354,14 +365,23 @@ export class RunManager {
     const profile = (opts.profile ?? d.profile ?? defaultProfile) as Profile;
     if (!['think', 'read', 'write'].includes(profile)) throw new Error(`unknown profile "${profile}" (think | read | write)`);
     if (profileRank(profile) > profileRank(caller.maxProfile)) throw new Error(`profile "${profile}" exceeds your maximum "${caller.maxProfile}"`);
+    // Without the OS wrapper a codex shell reads everything the deny-list misses,
+    // the reach of the claude engine's Bash: the same trust (maxProfile write) is required.
+    if (engine === 'codex' && profile !== 'think' && this.cfg.engines.codex.sandbox === 'none' && caller.maxProfile !== 'write') {
+      throw new Error(`engine "codex" profile "${profile}" is not available to you: this SwarmBase runs codex without an OS sandbox, so its shells are offered to write-trusted callers only (use profile "think")`);
+    }
 
     // the run-level default model is an engine-specific id, so it applies to the default engine only
     const model = String(opts.model ?? (engine === 'claude' ? d.model : undefined) ?? caller.defaultModels[engine]);
     if (!MODEL_RE.test(model)) throw new Error(`bad model id ${JSON.stringify(model)}`);
 
     const effortRaw = opts.effort ?? d.effort ?? null;
-    const effort = effortRaw === null ? null : String(effortRaw);
+    let effort = effortRaw === null ? null : String(effortRaw);
     if (effort !== null && !EFFORTS.has(effort)) throw new Error(`bad effort "${effort}" (low | medium | high | xhigh | max)`);
+    if (effort !== null && engine === 'codex' && CODEX_EFFORTS[effort] !== effort) {
+      warnings.push(`effort "${effort}" is not a Codex level; sent as "${CODEX_EFFORTS[effort]}"`);
+      effort = CODEX_EFFORTS[effort];
+    }
 
     let cwd = realpathSync(this.store.workDir(run.meta));
     if (opts.cwd !== undefined) {
@@ -384,6 +404,10 @@ export class RunManager {
         throw new Error('schema must be a JSON Schema object with type: "object" at the root');
       }
       schema = opts.schema;
+      if (engine === 'codex') {
+        const problem = strictSchemaProblem(schema);
+        if (problem) throw new Error(`schema ${problem}`);
+      }
     }
 
     let maxUsd: number | null = null;
@@ -397,7 +421,9 @@ export class RunManager {
     if (opts.maxTokens !== undefined) {
       const v = Number(opts.maxTokens);
       if (!Number.isInteger(v) || v <= 0) throw new Error('maxTokens must be a positive integer');
-      maxTokens = v;
+      const cap = this.cfg.engines.codex.maxTokensMax;
+      if (v > cap) warnings.push(`maxTokens ${v} clamped to this SwarmBase's per-agent maximum ${cap}`);
+      maxTokens = Math.min(v, cap);
     }
 
     const timeoutMs = Math.min(this.cfg.agentTimeoutMs, Math.max(10_000, Number(opts.timeoutMs ?? this.cfg.agentTimeoutMs) || this.cfg.agentTimeoutMs));
@@ -410,18 +436,35 @@ export class RunManager {
     return run.meta.budgetUsd - run.meta.spentUsd - run.reservedUsd;
   }
 
-  /** Reserve this agent's cap, waiting while other agents hold reservations.
-   *  Returns the reserved amount, or null when the budget is exhausted / aborted. */
-  private async reserve(run: ActiveRun, want: number, signal: AbortSignal): Promise<number | null> {
+  private availableTokens(run: ActiveRun): number {
+    return run.meta.budgetTokens - run.meta.spentTokens - run.reservedTokens;
+  }
+
+  /** What an agent wants to reserve (`tokens` is 0 for engines bounded in USD alone). */
+  private exhausted(run: ActiveRun, want: Reservation): boolean {
+    return this.available(run) < MIN_AGENT_USD || (want.tokens > 0 && this.availableTokens(run) < MIN_AGENT_TOKENS);
+  }
+
+  private exhaustedMessage(run: ActiveRun, want: Reservation): string {
+    const m = run.meta;
+    if (want.tokens > 0 && this.availableTokens(run) < MIN_AGENT_TOKENS && this.available(run) >= MIN_AGENT_USD) {
+      return `token budget exhausted: ${m.spentTokens} of ${m.budgetTokens} codex tokens spent (raise budgetTokens on the run)`;
+    }
+    return `budget exhausted: $${m.spentUsd.toFixed(2)} of $${m.budgetUsd.toFixed(2)} spent`;
+  }
+
+  /** Reserve this agent's caps, waiting while other agents hold reservations.
+   *  Returns the reserved amounts, or null when a budget is exhausted / aborted. */
+  private async reserve(run: ActiveRun, want: Reservation, signal: AbortSignal): Promise<Reservation | null> {
     for (;;) {
       if (signal.aborted || run.ending) return null;
-      const avail = this.available(run);
-      if (avail >= MIN_AGENT_USD) {
-        const cap = Math.min(want, avail);
-        run.reservedUsd += cap;
-        return cap;
+      if (!this.exhausted(run, want)) {
+        const r = { usd: Math.min(want.usd, this.available(run)), tokens: want.tokens > 0 ? Math.min(want.tokens, this.availableTokens(run)) : 0 };
+        run.reservedUsd += r.usd;
+        run.reservedTokens += r.tokens;
+        return r;
       }
-      if (run.reservedUsd <= 0) return null; // nothing will come back
+      if (run.reservedUsd <= 0 && run.reservedTokens <= 0) return null; // nothing will come back
       await new Promise<void>((res) => {
         const wake = () => { run.budgetWaiters.delete(wake); signal.removeEventListener('abort', wake); res(); };
         run.budgetWaiters.add(wake);
@@ -430,9 +473,11 @@ export class RunManager {
     }
   }
 
-  private release(run: ActiveRun, reserved: number, spent: number): void {
-    run.reservedUsd = Math.max(0, run.reservedUsd - reserved);
-    run.meta.spentUsd += spent;
+  private release(run: ActiveRun, reserved: Reservation, spent: Reservation): void {
+    run.reservedUsd = Math.max(0, run.reservedUsd - reserved.usd);
+    run.reservedTokens = Math.max(0, run.reservedTokens - reserved.tokens);
+    run.meta.spentUsd += spent.usd;
+    run.meta.spentTokens += spent.tokens;
     for (const w of [...run.budgetWaiters]) w();
   }
 
@@ -480,8 +525,9 @@ export class RunManager {
       return;
     }
 
-    if (this.available(run) < MIN_AGENT_USD && run.reservedUsd <= 0) {
-      replyErr(`budget exhausted: $${meta.spentUsd.toFixed(2)} of $${meta.budgetUsd.toFixed(2)} spent`);
+    const want: Reservation = { usd: a.maxUsd ?? Math.max(0.5, meta.budgetUsd / 8), tokens: a.engine === 'codex' ? a.maxTokens : 0 };
+    if (this.exhausted(run, want) && run.reservedUsd <= 0 && run.reservedTokens <= 0) {
+      replyErr(this.exhaustedMessage(run, want));
       return;
     }
 
@@ -501,14 +547,13 @@ export class RunManager {
       this.setStatus(run, slot, slot.skipped ? 'skipped' : 'null');
       this.store.emit(meta.id, { type: 'agent_end', n, status: slot.status, costUsd: 0, durationMs: 0, error: slot.skipped ? 'skipped before start' : why });
       this.store.saveMeta(meta);
-      if (budget && !slot.skipped) replyErr(`budget exhausted: $${meta.spentUsd.toFixed(2)} of $${meta.budgetUsd.toFixed(2)} spent`);
+      if (budget && !slot.skipped) replyErr(this.exhaustedMessage(run, want));
       else replyOk(null);
     };
 
     // run slot → budget reservation → global slot
     try { await run.runSem.acquire(slot.ac.signal); }
     catch { endEarly('run ended before start', false); return; }
-    const want = a.maxUsd ?? Math.max(0.5, meta.budgetUsd / 8);
     const reserved = await this.reserve(run, want, slot.ac.signal);
     if (reserved === null) {
       run.runSem.release();
@@ -518,7 +563,7 @@ export class RunManager {
     try { await this.globalSem.acquire(slot.ac.signal); }
     catch {
       run.runSem.release();
-      this.release(run, reserved, 0);
+      this.release(run, reserved, { usd: 0, tokens: 0 });
       endEarly('run ended before start', false);
       return;
     }
@@ -536,24 +581,28 @@ export class RunManager {
     };
 
     let outcome: AgentOutcome;
+    let spentTokens = 0;
     try {
       const common = {
         runId: meta.id, n, label: a.label, prompt, schema: a.schema, model: a.model, effort: a.effort, profile: a.profile,
-        cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved, streamPath: this.store.agentStreamPath(meta, n),
+        cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved.usd, streamPath: this.store.agentStreamPath(meta, n),
         apiKey: readApiKey(run.caller.apiKeyFile), dataDir: realpathSync(this.cfg.dataDir),
       };
       if (a.engine === 'codex') {
         const codex = this.cfg.engines.codex;
+        if (reserved.tokens < a.maxTokens) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: maxTokens ${a.maxTokens} cut to ${reserved.tokens}, what is left of the run's token budget` });
         const o = await runCodexAgent({
           ...common,
-          maxTokens: a.maxTokens,
+          maxTokens: reserved.tokens,
           homeDir: this.store.agentHomeDir(meta, n),
           baseUrl: codex.baseUrl!,
           codexBin: codex.bin,
           sandbox: codex.sandbox,
           extraRoBinds: codex.extraRoBinds,
+          denyExtra: [safeRealpath(run.caller.apiKeyFile), this.cfg.configPath].filter((p): p is string => !!p),
         }, this.meter!, slot.ac.signal, onActivity);
-        if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 (set config.prices to shadow-price it)` });
+        if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 against the USD budget (set config.prices to shadow-price it); the run's token budget bounds it` });
+        spentTokens = o.tokens;
         outcome = o;
       } else {
         outcome = await runClaudeAgent({
@@ -570,8 +619,8 @@ export class RunManager {
       run.runSem.release();
     }
 
-    this.release(run, reserved, outcome.costUsd);
-    this.send(run, { type: 'spent', usd: meta.spentUsd });
+    this.release(run, reserved, { usd: outcome.costUsd, tokens: spentTokens });
+    this.send(run, { type: 'spent', usd: meta.spentUsd, tokens: meta.spentTokens });
     let status: AgentStatus;
     if (outcome.ok) status = 'ok';
     else if (slot.skipped) status = 'skipped';
@@ -580,7 +629,7 @@ export class RunManager {
     this.setStatus(run, slot, status);
     if (outcome.ok) this.store.appendJournal(meta, { key, n, label: a.label, result: outcome.result, costUsd: outcome.costUsd });
     let error = slot.skipped ? 'skipped by operator' : (outcome.error ?? 'failed');
-    if (!outcome.ok && /max_budget/.test(error)) error = `hit its $${reserved.toFixed(2)} cap (raise opts.maxUsd or the run budget) — ${error}`;
+    if (!outcome.ok && /max_budget/.test(error)) error = `hit its $${reserved.usd.toFixed(2)} cap (raise opts.maxUsd or the run budget) — ${error}`;
     if (!outcome.ok && outcome.reason === 'token-ceiling') error = `hit its token ceiling (raise opts.maxTokens) — ${error}`;
     this.store.emit(meta.id, {
       type: 'agent_end', n, status, costUsd: outcome.costUsd, durationMs: outcome.durationMs,
@@ -590,6 +639,12 @@ export class RunManager {
     this.store.saveMeta(meta);
     replyOk(outcome.ok ? outcome.result : null);
   }
+}
+
+interface Reservation { usd: number; tokens: number }
+
+function safeRealpath(p: string): string | null {
+  try { return realpathSync(p); } catch { return null; }
 }
 
 function preview(v: unknown): string {

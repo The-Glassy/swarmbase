@@ -146,6 +146,18 @@ function persistLive(): void {
   try { writeFileSync(liveFile, JSON.stringify([...LIVE_GROUPS])); } catch { /* best effort */ }
 }
 
+/** Every engine records its agent's process group here, so shutdown and the
+ *  boot-time reaper see codex agents as well as claude ones. */
+export function trackAgentGroup(pgid: number): void {
+  LIVE_GROUPS.add(pgid);
+  persistLive();
+}
+
+export function untrackAgentGroup(pgid: number): void {
+  LIVE_GROUPS.delete(pgid);
+  persistLive();
+}
+
 export function killAllAgentGroups(sig: NodeJS.Signals = 'SIGKILL'): number {
   let n = 0;
   for (const pgid of LIVE_GROUPS) {
@@ -245,7 +257,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
     detached: true, // own process group, so tools it spawned die with it
   });
 
-  if (child.pid !== undefined) { LIVE_GROUPS.add(child.pid); persistLive(); }
+  if (child.pid !== undefined) trackAgentGroup(child.pid);
   let resultEvent: Record<string, unknown> | null = null;
   let harvested: unknown = undefined;
   let lastText = '';
@@ -313,7 +325,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
     const finish = (code: number | null, spawnError?: Error) => {
       if (settled) return;
       settled = true;
-      if (child.pid !== undefined) { LIVE_GROUPS.delete(child.pid); persistLive(); }
+      if (child.pid !== undefined) untrackAgentGroup(child.pid);
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
       out.end();

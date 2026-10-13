@@ -22,16 +22,22 @@
  *    files a workspace could plant; the workspace is never trusted, so a
  *    `.codex/` dir in it is ignored.
  *  - Tools per profile: think = none (`shell_tool`, `unified_exec`, web search
- *    off); read = shell under `:read-only`, web search; write = shell under
- *    `:workspace`. Sub-agents, goals, image viewing and user-input requests
- *    are off everywhere (the image tool reads files from the CLI process,
- *    outside its sandbox).
+ *    off); read = shell under `:read-only` with NO network (the outer wrapper
+ *    shares the host's network namespace, so a shell with network would reach
+ *    every loopback service on the host, this daemon's dashboard included),
+ *    plus the CLI's web search; write = shell under `:workspace` with network
+ *    (trusted callers only, like the claude engine's Bash). Sub-agents, goals,
+ *    image viewing and user-input requests are off everywhere (the image tool
+ *    reads files from the CLI process, outside its sandbox).
  *  - Budget: the CLI reports usage only in `turn.completed`, and an exec run
  *    is one turn, so the meter prices every response as it passes: the agent
- *    is stopped when its token ceiling (opts.maxTokens) or, when a price row
- *    exists for the model, its USD cap is crossed. Overshoot is bounded by one
- *    response. Without a price row the agent costs $0 and the ceiling is the
- *    only limit (the ChatGPT backend is subscription-metered).
+ *    is stopped when its token ceiling (opts.maxTokens, clamped by the daemon
+ *    and reserved from the run's token budget) or, when a price row exists for
+ *    the model, its USD cap is crossed. Overshoot is bounded by one response.
+ *    Without a price row the agent costs $0 and the token budget is the limit
+ *    (the ChatGPT backend is subscription-metered). When the meter saw no
+ *    usage (a response it could not parse), the CLI's own `turn.completed`
+ *    count is used instead.
  *
  * Gotchas:
  *  - Prompt on stdin (`-`); with a prompt argument and a non-TTY stdin the CLI
@@ -42,11 +48,11 @@
  *    a run fails on `turn.failed`, `error`, or a non-zero exit only.
  */
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { Profile } from '../config.js';
-import { estimateCost, priceFor, type Activity, type AgentOutcome } from './claude.js';
+import { estimateCost, priceFor, trackAgentGroup, untrackAgentGroup, type Activity, type AgentOutcome } from './claude.js';
 import type { Usage, UsageMeter } from '../meter.js';
 
 export interface CodexAgentSpec {
@@ -74,6 +80,9 @@ export interface CodexAgentSpec {
   extraRoBinds: string[];
   /** SwarmBase data dir (realpath), for the deny rules. */
   dataDir: string;
+  /** Files outside the data dir that hold this caller's secrets (its apiKeyFile,
+   *  the daemon's config file): denied by path. */
+  denyExtra: string[];
 }
 
 export interface CodexOutcome extends AgentOutcome {
@@ -89,43 +98,110 @@ function tomlStr(s: string): string {
 }
 
 /** Deny entries for the CLI's permission profile (a deny-list: the outer
- *  wrapper is the allow-list). Mirrors the claude engine's deny rules. */
-export function denyPaths(dataDir: string, homeDir: string): string[] {
+ *  wrapper is the allow-list, and under `sandbox: "none"` this list is the
+ *  only read barrier). Mirrors the claude engine's deny rules: the daemon's
+ *  secrets and run records, every agent's CODEX_HOME (a sibling's config.toml
+ *  holds its meter bearer), the caller's own key file and the config file,
+ *  `.env`/token/credential files under the workspace, and the usual credential dirs. */
+export function denyPaths(dataDir: string, homeDir: string, extra: string[] = [], cwd: string | null = null): string[] {
   const h = homedir();
   const d = dataDir.replace(/\/+$/, '');
   return [
     `${d}/*.token`, `${d}/*.key`, `${d}/config.json`, `${d}/config.json.*`, `${d}/outbox.json`, `${d}/live-agents.json`,
-    ...['meta.json', 'events.jsonl', 'journal.jsonl', 'script.js', 'args.json', 'result.json', 'agents/*.jsonl', 'agents/*.json', 'agents/*.txt', 'agents/*.md'].map((f) => `${d}/runs/*/${f}`),
+    ...runRecordPaths(d),
     `${homeDir}/config.toml`, // the meter bearer; the dir itself stays readable so `bash -l` finds an (absent) rc file quietly
+    ...extra,
+    // the CLI expands globs into mounts when the session starts, so they need a directory prefix: the workspace
+    ...(cwd ? ['.env', '.env.*', '*.token', '*credentials*'].map((g) => `${cwd.replace(/\/+$/, '')}/**/${g}`) : []),
     `${h}/.ssh`, `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`, `${h}/.aws`, `${h}/.config`, `${h}/.gnupg`,
+    `${h}/.netrc`, `${h}/.git-credentials`, `${h}/.npmrc`, `${h}/.docker`, `${h}/.kube`, `${h}/.portal`, `${h}/.swarmbase`,
   ];
+}
+
+const RUN_RECORDS = ['meta.json', 'events.jsonl', 'journal.jsonl', 'script.js', 'args.json', 'result.json'];
+
+/**
+ * Every run's records and agent files, one exact entry each (plus `agents/*`
+ * and `agents/**\/config.toml` per run), enumerated when the agent starts.
+ * Glob shapes differ between CLI versions — 0.158 expands a `*` directory
+ * component, 0.162 does not; 0.162 denies an explicit directory, 0.158 fails
+ * on one — while exact paths, a `*` in the last component and `**` (with
+ * `glob_scan_max_depth`) work on both. Globs are expanded when the session
+ * starts anyway, so listing the directory then loses nothing.
+ */
+export function runRecordPaths(dataDir: string): string[] {
+  const out: string[] = [];
+  const runs = join(dataDir, 'runs');
+  let names: string[] = [];
+  try { names = readdirSync(runs); } catch { return out; }
+  for (const name of names) {
+    const run = join(runs, name);
+    for (const f of RUN_RECORDS) if (existsSync(join(run, f))) out.push(join(run, f));
+    out.push(`${run}/agents/*`, `${run}/agents/**/config.toml`);
+  }
+  return out;
+}
+
+/** Keywords whose value is a map of schemas, a list of schemas, or one schema. */
+const SCHEMA_MAPS = new Set(['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas']);
+const SCHEMA_LISTS = new Set(['anyOf', 'oneOf', 'allOf', 'prefixItems']);
+const SCHEMA_ONE = new Set(['items', 'not', 'if', 'then', 'else', 'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'contains']);
+
+function isObjectSchema(s: Record<string, unknown>): boolean {
+  return s.type === 'object' || (Array.isArray(s.type) && s.type.includes('object')) || ('properties' in s && s.type === undefined);
+}
+
+/** Walk a schema's subschemas (not its data: `enum`, `const`, `default` and
+ *  `examples` are left alone), rebuilding each object schema with `f`. */
+function mapSchema(schema: unknown, f: (s: Record<string, unknown>, at: string) => Record<string, unknown>, at = '#'): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    if (SCHEMA_MAPS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+      const sub: Record<string, unknown> = {};
+      for (const [name, def] of Object.entries(v as Record<string, unknown>)) sub[name] = mapSchema(def, f, `${at}/${k}/${name}`);
+      out[k] = sub;
+    } else if (SCHEMA_LISTS.has(k) && Array.isArray(v)) {
+      out[k] = v.map((def, i) => mapSchema(def, f, `${at}/${k}/${i}`));
+    } else if (SCHEMA_ONE.has(k) && v && typeof v === 'object') {
+      out[k] = mapSchema(v, f, `${at}/${k}`);
+    } else out[k] = v;
+  }
+  return f(out, at);
 }
 
 /**
  * The Responses API validates `--output-schema` as a strict schema: every object
  * must carry `additionalProperties: false` (the claude engine never cared). Add
- * it wherever a script's schema left it out, recursively, without touching
- * anything else.
+ * it wherever a script's schema left it out, recursively, touching nothing else.
  */
 export function strictSchema(schema: unknown): unknown {
-  if (Array.isArray(schema)) return schema.map(strictSchema);
-  if (!schema || typeof schema !== 'object') return schema;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
-    if (k === 'properties' || k === '$defs' || k === 'definitions') {
-      const sub: Record<string, unknown> = {};
-      for (const [name, def] of Object.entries((v ?? {}) as Record<string, unknown>)) sub[name] = strictSchema(def);
-      out[k] = sub;
-    } else out[k] = strictSchema(v);
-  }
-  const isObject = out.type === 'object' || (Array.isArray(out.type) && out.type.includes('object')) || ('properties' in out && out.type === undefined);
-  if (isObject && out.additionalProperties === undefined) out.additionalProperties = false;
-  return out;
+  return mapSchema(schema, (s) => (isObjectSchema(s) && s.additionalProperties === undefined ? { ...s, additionalProperties: false } : s));
+}
+
+/**
+ * What strict mode will reject, found before the agent starts (the backend's
+ * answer would be a 400, which the script sees as `null`): an object whose
+ * properties aren't all `required`, or one that allows extra properties.
+ * Returns a message, or null when the schema is strict-compatible.
+ */
+export function strictSchemaProblem(schema: unknown): string | null {
+  let problem: string | null = null;
+  mapSchema(schema, (s, at) => {
+    if (problem || !isObjectSchema(s)) return s;
+    if (s.additionalProperties !== undefined && s.additionalProperties !== false) problem = `${at}: additionalProperties must be false (or omitted) for engine "codex"`;
+    const props = Object.keys((s.properties ?? {}) as object);
+    const required = new Set(Array.isArray(s.required) ? s.required.map(String) : []);
+    const missing = props.filter((p) => !required.has(p));
+    if (!problem && missing.length) problem = `${at}: every property must be listed in required for engine "codex" (missing: ${missing.join(', ')}); make an optional field nullable instead`;
+    return s;
+  });
+  return problem;
 }
 
 /** The agent's CODEX_HOME/config.toml. */
 export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bearer: string }): string {
-  const deny = denyPaths(spec.dataDir, spec.homeDir).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
+  const deny = denyPaths(spec.dataDir, spec.homeDir, spec.denyExtra, spec.cwd).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
   const lines = [
     `model = ${tomlStr(spec.model)}`,
     'model_provider = "swarmbase"',
@@ -160,20 +236,22 @@ export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bea
     '[permissions.swarm-think]',
     'extends = ":read-only"',
     '[permissions.swarm-think.filesystem]',
+    'glob_scan_max_depth = 8',
     '":workspace_roots" = "read"',
     deny,
     '',
     '[permissions.swarm-read]',
     'extends = ":read-only"',
     '[permissions.swarm-read.filesystem]',
+    'glob_scan_max_depth = 8',
     '":workspace_roots" = "read"',
     deny,
-    '[permissions.swarm-read.network]',
-    'enabled = true',
+    // no [permissions.swarm-read.network]: the read shell has no network at all
     '',
     '[permissions.swarm-write]',
     'extends = ":workspace"',
     '[permissions.swarm-write.filesystem]',
+    'glob_scan_max_depth = 8',
     '":workspace_roots" = "write"',
     deny,
     '[permissions.swarm-write.network]',
@@ -209,6 +287,7 @@ function roBindTry(p: string): string[] {
 export function binMounts(bins: string[]): string[] {
   const dirs = new Set<string>();
   for (const b of bins) {
+    if (!isAbsolute(b)) continue; // a bare name would mount `.` over the sandbox root; config resolves it first
     dirs.add(dirname(b));
     let real: string;
     try { real = realpathSync(b); } catch { continue; } // resolved by PATH inside
@@ -290,7 +369,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
       const m = model ?? spec.model;
       if (priceFor(m)) costUsd += estimateCost(m, priceable(u)); else unpriced = true;
       if (tokens > spec.maxTokens) stop('token-ceiling', `token ceiling: ${tokens} tokens > maxTokens ${spec.maxTokens}`);
-      else if (spec.maxBudgetUsd !== null && !unpriced && costUsd > spec.maxBudgetUsd) stop('max_budget', `max_budget: $${costUsd.toFixed(3)} > cap $${spec.maxBudgetUsd.toFixed(2)}`);
+      else if (spec.maxBudgetUsd !== null && costUsd > spec.maxBudgetUsd) stop('max_budget', `max_budget: $${costUsd.toFixed(3)} > cap $${spec.maxBudgetUsd.toFixed(2)}`);
     },
   });
 
@@ -321,6 +400,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: true, // own process group, so the CLI's commands die with it
   });
+  if (child.pid !== undefined) trackAgentGroup(child.pid);
 
   let lastText = '';
   let failure: string | null = null;
@@ -399,10 +479,20 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
       settled = true;
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
+      if (child.pid !== undefined) untrackAgentGroup(child.pid);
       meter.release(slot.bearer);
       out.end();
       try { rmSync(spec.homeDir, { recursive: true, force: true }); } catch { /* best effort */ }
       const durationMs = Date.now() - started;
+      // The meter saw nothing (a body it could not parse) but the CLI counted
+      // its turn: take the CLI's word rather than report a free agent.
+      const t = turnUsage as Record<string, unknown> | null;
+      if (tokens === 0 && t && (Number(t.input_tokens) > 0 || Number(t.output_tokens) > 0)) {
+        const u: Usage = { inputTokens: Number(t.input_tokens ?? 0), cachedInputTokens: Number(t.cached_input_tokens ?? 0), outputTokens: Number(t.output_tokens ?? 0), model: null };
+        tokens = u.inputTokens + u.outputTokens;
+        lastUsage.inputTokens = u.inputTokens; lastUsage.cachedInputTokens = u.cachedInputTokens; lastUsage.outputTokens = u.outputTokens;
+        if (priceFor(spec.model)) costUsd = estimateCost(spec.model, priceable(u)); else unpriced = true;
+      }
       const usage = { ...lastUsage, tokens, turn: turnUsage };
       const base = { costUsd, durationMs, usage, unpriced, tokens };
       const fail = (error: string, reason: string) => resolve({ ok: false, result: null, error, reason, ...base });

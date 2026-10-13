@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     }
     meter = new UsageMeter();
     await meter.start();
-    log(`codex engine on (${cfg.engines.codex.sandbox === 'bwrap' ? 'bubblewrap wrapper' : 'NO OS wrapper: the CLI deny-list is the only read barrier'})`);
+    log(`codex engine on (${cfg.engines.codex.sandbox === 'bwrap' ? 'bubblewrap wrapper' : 'NO OS wrapper: the CLI deny-list is the only read barrier; codex shells go to write-trusted callers only'})`);
   }
   const runs = new RunManager(cfg, store, ensureEmptyMcpConfig(cfg.dataDir), notifier, meter);
   for (const meta of runs.markOrphansInterrupted()) {

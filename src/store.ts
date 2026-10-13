@@ -12,7 +12,7 @@
  *   work/          default cwd for subagents
  */
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -38,6 +38,9 @@ export interface RunMeta {
   defaults: AgentDefaults;
   budgetUsd: number;
   spentUsd: number;
+  /** Token budget for codex agents (their spend is $0 without a price row). */
+  budgetTokens: number;
+  spentTokens: number;
   counts: Record<AgentStatus, number>;
   agentsTotal: number;
   currentPhase: string | null;
@@ -48,7 +51,7 @@ export interface RunMeta {
 }
 
 export type RunEvent = { seq: number; ts: string } & (
-  | { type: 'run_start'; caller: string; label: string | null; budgetUsd: number; resumedFrom: string | null }
+  | { type: 'run_start'; caller: string; label: string | null; budgetUsd: number; budgetTokens?: number; resumedFrom: string | null }
   | { type: 'meta'; meta: unknown }
   | { type: 'phase'; title: string }
   | { type: 'log'; message: string }
@@ -56,7 +59,7 @@ export type RunEvent = { seq: number; ts: string } & (
   | { type: 'agent_start'; n: number }
   | { type: 'agent_activity'; n: number; kind: string; summary: string }
   | { type: 'agent_end'; n: number; status: AgentStatus; costUsd: number; durationMs: number; error?: string; resultPreview?: string; usage?: unknown }
-  | { type: 'run_end'; status: RunStatus; spentUsd: number; error: string | null }
+  | { type: 'run_end'; status: RunStatus; spentUsd: number; spentTokens?: number; error: string | null }
 );
 
 /** Distributive Omit, so each event variant keeps its own fields. */
@@ -95,6 +98,8 @@ export class RunStore {
       try {
         const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as RunMeta;
         meta.dir = dir;
+        meta.budgetTokens ??= 0; // runs recorded before the token budget existed
+        meta.spentTokens ??= 0;
         this.metas.set(meta.id, meta);
         this.seqs.set(meta.id, this.readEvents(meta.id).reduce((m, e) => Math.max(m, e.seq), 0));
       } catch (e) {
@@ -108,7 +113,7 @@ export class RunStore {
     return [...this.metas.values()].filter((m) => m.status === 'running');
   }
 
-  create(input: { caller: string; label: string | null; script: string; args: unknown; defaults: AgentDefaults; budgetUsd: number; resumedFrom: string | null }): RunMeta {
+  create(input: { caller: string; label: string | null; script: string; args: unknown; defaults: AgentDefaults; budgetUsd: number; budgetTokens: number; resumedFrom: string | null }): RunMeta {
     const id = newRunId();
     const dir = join(this.runsDir, `${stamp()}-${id}`);
     mkdirSync(join(dir, 'agents'), { recursive: true });
@@ -125,6 +130,8 @@ export class RunStore {
       defaults: input.defaults,
       budgetUsd: input.budgetUsd,
       spentUsd: 0,
+      budgetTokens: input.budgetTokens,
+      spentTokens: 0,
       counts: EMPTY_COUNTS(),
       agentsTotal: 0,
       currentPhase: null,
@@ -262,6 +269,20 @@ export class RunStore {
   /** Throwaway home dir (CODEX_HOME) for an engine that keeps state on disk; the engine deletes it. */
   agentHomeDir(meta: RunMeta, n: number): string {
     return join(meta.dir, 'agents', `${n}-home`);
+  }
+
+  /** Delete the throwaway homes a crashed daemon left behind (an engine deletes
+   *  its own when the agent ends). Returns how many went. */
+  sweepAgentHomes(meta: RunMeta): number {
+    let n = 0;
+    const dir = join(meta.dir, 'agents');
+    let names: string[] = [];
+    try { names = readdirSync(dir); } catch { return 0; }
+    for (const name of names) {
+      if (!/^\d+-home$/.test(name)) continue;
+      try { rmSync(join(dir, name), { recursive: true, force: true }); n++; } catch { /* best effort */ }
+    }
+    return n;
   }
 
   workDir(meta: RunMeta): string {

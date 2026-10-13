@@ -27,6 +27,7 @@ export class SwarmTools implements ToolHost {
       effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'Default effort for this run\'s agents.' },
       profile: { type: 'string', enum: [...PROFILES], description: 'Default tool profile: think (no tools) | read | write.' },
       budgetUsd: { type: 'number', description: 'Hard USD ceiling for the run; agent() throws once it is spent.' },
+      budgetTokens: { type: 'integer', description: 'Token ceiling for this run\'s codex agents (input + output over all their requests); agent() throws once it is spent.' },
     };
     return [
       {
@@ -114,6 +115,8 @@ export class SwarmTools implements ToolHost {
           maxProfile: caller.maxProfile,
           budgetDefault: caller.runUsdDefault,
           budgetMax: caller.runUsdMax,
+          tokensDefault: caller.runTokensDefault,
+          tokensMax: caller.runTokensMax,
           maxAgents: this.cfg.maxAgentsPerRun,
           perRun: this.cfg.perRunConcurrency,
           cwdRoots: caller.cwdRoots,
@@ -155,6 +158,15 @@ export class SwarmTools implements ToolHost {
     } else if (resumeFrom) {
       budgetUsd = Math.min(resumeFrom.budgetUsd, caller.runUsdMax);
     }
+    let budgetTokens = caller.runTokensDefault;
+    if (args.budgetTokens !== undefined) {
+      const b = Number(args.budgetTokens);
+      if (!Number.isInteger(b) || b <= 0) return text('budgetTokens must be a positive integer.', true);
+      if (b > caller.runTokensMax) return text(`budgetTokens ${b} exceeds your per-run maximum of ${caller.runTokensMax}.`, true);
+      budgetTokens = b;
+    } else if (resumeFrom && resumeFrom.budgetTokens > 0) {
+      budgetTokens = Math.min(resumeFrom.budgetTokens, caller.runTokensMax);
+    }
 
     const profile = args.profile ?? resumeFrom?.defaults.profile;
     if (profile !== undefined && !(PROFILES as readonly string[]).includes(String(profile))) return text(`unknown profile "${profile}".`, true);
@@ -168,10 +180,11 @@ export class SwarmTools implements ToolHost {
     };
     const label = typeof args.label === 'string' && args.label.trim() ? args.label.trim().slice(0, 80) : (resumeFrom?.label ?? null);
 
-    const meta = this.runs.start({ caller, script, args: runArgs, label, defaults, budgetUsd, resumeFrom: resumeFrom?.id ?? null });
+    const meta = this.runs.start({ caller, script, args: runArgs, label, defaults, budgetUsd, budgetTokens, resumeFrom: resumeFrom?.id ?? null });
     const url = this.notifier.runUrl(meta.id);
+    const tokensNote = caller.engines.includes('codex') ? ` and ${budgetTokens.toLocaleString('en-US')} codex tokens` : '';
     return text([
-      `Started run ${meta.id}${label ? ` "${label}"` : ''} — budget $${budgetUsd.toFixed(2)}${resumeFrom ? `, resuming from ${resumeFrom.id} (cached agent results replay free)` : ''}.`,
+      `Started run ${meta.id}${label ? ` "${label}"` : ''} — budget $${budgetUsd.toFixed(2)}${tokensNote}${resumeFrom ? `, resuming from ${resumeFrom.id} (cached agent results replay free)` : ''}.`,
       'You will get a [swarmbase] notice when it ends. `status` shows progress meanwhile.',
       ...(url ? [`Dashboard: ${url}`] : []),
     ].join('\n'));
@@ -237,7 +250,7 @@ export function agentRows(events: RunEvent[]): AgentRow[] {
 export function statusText(meta: RunMeta, events: RunEvent[], url: string | null): string {
   const took = fmtDuration((meta.endedAt ? Date.parse(meta.endedAt) : Date.now()) - Date.parse(meta.createdAt));
   const lines = [
-    `Run ${meta.id}${meta.label ? ` "${meta.label}"` : ''} — ${meta.status}${meta.currentPhase ? ` · phase "${meta.currentPhase}"` : ''} · ${countsLine(meta)} · $${meta.spentUsd.toFixed(2)} of $${meta.budgetUsd.toFixed(2)} · ${took}`,
+    `Run ${meta.id}${meta.label ? ` "${meta.label}"` : ''} — ${meta.status}${meta.currentPhase ? ` · phase "${meta.currentPhase}"` : ''} · ${countsLine(meta)} · $${meta.spentUsd.toFixed(2)} of $${meta.budgetUsd.toFixed(2)}${meta.spentTokens ? ` · ${meta.spentTokens.toLocaleString('en-US')} of ${meta.budgetTokens.toLocaleString('en-US')} codex tokens` : ''} · ${took}`,
   ];
   if (meta.error) lines.push(`Error: ${meta.error}`);
   if (meta.phases.length) lines.push(`Phases: ${meta.phases.join(' → ')}`);
