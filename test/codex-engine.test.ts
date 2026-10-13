@@ -96,6 +96,15 @@ test('rendered CODEX_HOME: profile selected by default_permissions, never -s; th
   } finally { fs.rmSync(dd, { recursive: true, force: true }); }
   assert.match(read, /^"\/w\/work\/\*\*\/\.env" = "deny"$/m, 'workspace-rooted: the CLI expands globs at session start and refuses /**');
   assert.match(renderConfig(spec({ denyExtra: ['/etc/sb/alice.key', '/etc/sb/config.json'] }), meter), /^"\/etc\/sb\/alice\.key" = "deny"\n"\/etc\/sb\/config\.json" = "deny"$/m, 'the caller\'s key file and the config file');
+  // the config file usually sits inside the data dir: once, or the CLI's TOML parser refuses the duplicate key
+  assert.equal(denyPaths('/sb', '/w/home', ['/sb/alice.key', '/sb/config.json'], '/w/work').filter((p) => p === '/sb/config.json').length, 1, 'no duplicate TOML key');
+  // and never an ancestor of the workspace or the agent home (a denied directory is a read-only mount over the agent's own files)
+  const home = os.homedir();
+  const under = renderConfig(spec({ dataDir: path.join(home, '.swarmbase'), cwd: path.join(home, '.swarmbase', 'runs', 'r1', 'work'), homeDir: path.join(home, '.swarmbase', 'runs', 'r1', 'agents', '1-home') }), meter);
+  assert.doesNotMatch(under, new RegExp(`^"${home}/\\.swarmbase" = "deny"$`, 'm'), 'the data dir itself is never denied');
+  assert.match(under, new RegExp(`^"${home}/\\.swarmbase/config\\.json" = "deny"$`, 'm'));
+  assert.doesNotMatch(renderConfig(spec({ cwd: path.join(home, '.config', 'proj') }), meter), new RegExp(`^"${home}/\\.config" = "deny"$`, 'm'), 'an ancestor of the cwd is dropped');
+  assert.match(renderConfig(spec(), meter), new RegExp(`^"${home}/\\.config" = "deny"$`, 'm'));
   assert.doesNotMatch(read, /shell_tool/);
   const think = renderConfig(spec({ profile: 'think', effort: 'high' }), meter);
   assert.match(think, /^shell_tool = false$/m);

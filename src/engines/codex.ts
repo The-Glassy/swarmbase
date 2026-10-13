@@ -106,7 +106,14 @@ function tomlStr(s: string): string {
 export function denyPaths(dataDir: string, homeDir: string, extra: string[] = [], cwd: string | null = null): string[] {
   const h = homedir();
   const d = dataDir.replace(/\/+$/, '');
-  return [
+  // A Set: the CLI's TOML parser refuses a duplicate key, and the config file
+  // usually sits inside the data dir. Never an ancestor of the workspace or
+  // the agent's home: the CLI's sandbox denies a directory by mounting over
+  // it, and the agent's own files then sit on a read-only mount (the data dir
+  // itself is usually ~/.swarmbase, so no entry for it: its files are listed).
+  const roots = [cwd, homeDir].filter((r): r is string => !!r).map((r) => r.replace(/\/+$/, ''));
+  const ancestorOfRoot = (p: string) => !/[*?[]/.test(p) && roots.some((r) => r === p || r.startsWith(p + '/'));
+  return [...new Set([
     `${d}/*.token`, `${d}/*.key`, `${d}/config.json`, `${d}/config.json.*`, `${d}/outbox.json`, `${d}/live-agents.json`,
     ...runRecordPaths(d),
     `${homeDir}/config.toml`, // the meter bearer; the dir itself stays readable so `bash -l` finds an (absent) rc file quietly
@@ -114,8 +121,8 @@ export function denyPaths(dataDir: string, homeDir: string, extra: string[] = []
     // the CLI expands globs into mounts when the session starts, so they need a directory prefix: the workspace
     ...(cwd ? ['.env', '.env.*', '*.token', '*credentials*'].map((g) => `${cwd.replace(/\/+$/, '')}/**/${g}`) : []),
     `${h}/.ssh`, `${h}/.claude`, `${h}/.claude.json`, `${h}/.codex`, `${h}/.aws`, `${h}/.config`, `${h}/.gnupg`,
-    `${h}/.netrc`, `${h}/.git-credentials`, `${h}/.npmrc`, `${h}/.docker`, `${h}/.kube`, `${h}/.portal`, `${h}/.swarmbase`,
-  ];
+    `${h}/.netrc`, `${h}/.git-credentials`, `${h}/.npmrc`, `${h}/.docker`, `${h}/.kube`, `${h}/.portal`,
+  ])].filter((p) => !ancestorOfRoot(p));
 }
 
 const RUN_RECORDS = ['meta.json', 'events.jsonl', 'journal.jsonl', 'script.js', 'args.json', 'result.json'];
