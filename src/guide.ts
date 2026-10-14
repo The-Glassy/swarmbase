@@ -38,7 +38,8 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
     plus WebFetch/WebSearch. write: + Edit/Write inside its cwd, and Bash. Default read; your maximum is
     "${opts.maxProfile}".${codex ? ` For engine "codex": think = no tools; read = a read-only shell with no network,
     plus the CLI's web search; write = a shell that may write inside its cwd and has network (git, curl).` : ''}
-  - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir.
+  - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir, which is
+    deleted when the run ends (start the run with \`keepWork: true\` to keep it; \`resume\` gets a fresh one).
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.
   - \`timeoutMs\` — per-agent wall clock (default and cap 30 min).
   - \`maxUsd\` — this agent's spending cap (default max($0.50, budget/8)). The cap is reserved from the run budget
@@ -70,7 +71,9 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
 Every non-null agent result is journaled. \`resume\` starts a new run (same script unless you pass an edited one)
 whose agent() calls are answered from that journal when the call matches exactly (prompt + schema + model +
 effort + profile + engine + cwd), so only new or changed calls cost anything. Use it after a failure, a cancel, a daemon
-restart, or to iterate on a script.
+restart, or to iterate on a script. The replay returns the journaled *result*, not the files the agent wrote: the
+old run's scratch dir is gone by then (unless it ran with \`keepWork: true\`), so a result that names a file under it
+points at nothing in the resumed run. Have such an agent return the content, or run it \`fresh: true\`.
 
 ## Patterns
 - Fan out → verify: N finders in parallel, then for each finding K skeptics told to REFUTE; keep what survives.

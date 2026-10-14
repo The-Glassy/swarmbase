@@ -136,6 +136,9 @@ export function estimateCost(model: string, u: Record<string, any>): number {
     + Number(u.cache_read_input_tokens ?? 0) * p.cacheRead + (wAll - w1h) * p.cacheWrite + w1h * p.cacheWrite1h) / 1e6;
 }
 
+/** An aborted agent gets SIGTERM, then its whole process group gets SIGKILL this much later. */
+export const KILL_GRACE_MS = 5000;
+
 /** Process groups of live agent processes, mirrored to disk so a crashed daemon's
  *  orphans can be reaped on the next boot. */
 const LIVE_GROUPS = new Set<number>();
@@ -274,7 +277,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
     if (endReason) return;
     endReason = why;
     killGroup('SIGTERM');
-    setTimeout(() => killGroup('SIGKILL'), 5000).unref();
+    setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref();
   };
   const onAbort = () => stop('cancelled');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });

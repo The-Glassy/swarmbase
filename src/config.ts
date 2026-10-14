@@ -89,6 +89,9 @@ export interface Config {
   apiBaseUrl?: string | null;
   /** @deprecated use engines.claude.bin */
   claudeBin?: string;
+  /** Delete each run's `work/` (clones, toolchains, scratch) when the run ends, unless the run
+   *  was started with `keepWork`. Also sweeps the work dirs of ended runs on boot. Default true. */
+  deleteWorkOnEnd: boolean;
   /** Extra/override model price rows (USD per MTok) for estimating killed agents' spend
    *  (and all of a codex agent's spend: the Codex CLI reports tokens, not cost). */
   prices?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; cacheWrite1h: number }>;
@@ -117,6 +120,7 @@ const DEFAULTS: Omit<Config, 'callers'> = {
     claude: { bin: 'claude', baseUrl: null },
     codex: { bin: 'codex', baseUrl: null, sandbox: 'bwrap', maxTokensDefault: 3_000_000, maxTokensMax: 3_000_000, extraRoBinds: [] },
   },
+  deleteWorkOnEnd: true,
   dashboard: { adminLogins: [] },
 };
 
@@ -177,6 +181,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   cfg.apiBaseUrl = claude.baseUrl;
   cfg.claudeBin = claude.bin;
   cfg.dataDir = expand(cfg.dataDir);
+  if (typeof cfg.deleteWorkOnEnd !== 'boolean') throw new Error('config: deleteWorkOnEnd must be true or false');
   const names = new Set<string>();
   for (const c of cfg.callers) {
     if (names.has(c.name)) throw new Error(`config: duplicate caller "${c.name}"`);

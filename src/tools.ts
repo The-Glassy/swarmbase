@@ -28,6 +28,7 @@ export class SwarmTools implements ToolHost {
       profile: { type: 'string', enum: [...PROFILES], description: 'Default tool profile: think (no tools) | read | write.' },
       budgetUsd: { type: 'number', description: 'Hard USD ceiling for the run; agent() throws once it is spent.' },
       budgetTokens: { type: 'integer', description: 'Token ceiling for this run\'s codex agents (input + output over all their requests); agent() throws once it is spent.' },
+      keepWork: { type: 'boolean', description: "Keep the run's work dir (clones, toolchains, scratch) after it ends. Default: deleted at run end." },
     };
     return [
       {
@@ -180,7 +181,8 @@ export class SwarmTools implements ToolHost {
     };
     const label = typeof args.label === 'string' && args.label.trim() ? args.label.trim().slice(0, 80) : (resumeFrom?.label ?? null);
 
-    const meta = this.runs.start({ caller, script, args: runArgs, label, defaults, budgetUsd, budgetTokens, resumeFrom: resumeFrom?.id ?? null });
+    const keepWork = args.keepWork === true;
+    const meta = this.runs.start({ caller, script, args: runArgs, label, defaults, budgetUsd, budgetTokens, resumeFrom: resumeFrom?.id ?? null, keepWork });
     const url = this.notifier.runUrl(meta.id);
     const tokensNote = caller.engines.includes('codex') ? ` and ${budgetTokens.toLocaleString('en-US')} codex tokens` : '';
     return text([

@@ -20,7 +20,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { isUnder, profileRank, type CallerPolicy, type Config, type EngineName, type Profile } from './config.js';
-import { killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome } from './engines/claude.js';
+import { killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome, KILL_GRACE_MS } from './engines/claude.js';
 import { runCodexAgent, strictSchemaProblem } from './engines/codex.js';
 import type { UsageMeter } from './meter.js';
 import { Semaphore } from './semaphore.js';
@@ -80,6 +80,7 @@ export interface StartRunInput {
   budgetUsd: number;
   budgetTokens: number;
   resumeFrom: string | null;
+  keepWork?: boolean;
 }
 
 interface ResolvedAgent {
@@ -146,6 +147,7 @@ export class RunManager {
       budgetUsd: input.budgetUsd,
       budgetTokens: input.budgetTokens,
       resumedFrom: input.resumeFrom,
+      keepWork: input.keepWork,
     });
     this.store.emit(meta.id, { type: 'run_start', caller: meta.caller, label: meta.label, budgetUsd: meta.budgetUsd, budgetTokens: meta.budgetTokens, resumedFrom: meta.resumedFrom });
 
@@ -315,7 +317,8 @@ export class RunManager {
     run.ending = true;
     clearTimeout(run.timer);
     clearInterval(run.watchdog);
-    for (const slot of run.agents.values()) if (slot.status === 'queued' || slot.status === 'running') slot.ac.abort();
+    let aborted = 0;
+    for (const slot of run.agents.values()) if (slot.status === 'queued' || slot.status === 'running') { slot.ac.abort(); aborted++; }
     for (const w of run.budgetWaiters) w();
     try { run.child.kill('SIGKILL'); } catch { /* gone */ }
 
@@ -338,6 +341,17 @@ export class RunManager {
         this.store.emit(meta.id, { type: 'run_end', status, spentUsd: meta.spentUsd, spentTokens: meta.spentTokens, error });
       } catch (e) {
         console.error(`[swarmbase] run ${meta.id} final bookkeeping failed:`, e);
+      }
+      // The work dir (clones, toolchains, scratch) is the bulk of a run on disk and the
+      // daemon never reads it after the end: resume starts a fresh run with its own.
+      // An aborted agent's process group is only SIGKILLed KILL_GRACE_MS after SIGTERM,
+      // and a descendant that ignored SIGTERM may still be writing there until then, so
+      // in that case the delete waits until the kill has gone out.
+      if (this.cfg.deleteWorkOnEnd && !meta.keepWork) {
+        const deleteWork = () => {
+          try { this.store.deleteWork(meta); } catch (e) { console.error(`[swarmbase] run ${meta.id} work dir cleanup failed:`, e); }
+        };
+        if (aborted) setTimeout(deleteWork, KILL_GRACE_MS + 1000).unref(); else deleteWork();
       }
       this.active.delete(meta.id);
       try { this.listener.runEnded(meta); } catch (e) { console.error('[swarmbase] runEnded listener failed:', e); }
