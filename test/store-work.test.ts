@@ -18,7 +18,7 @@ function fill(dir: string) {
   writeFileSync(join(dir, 'frames.bin'), 'y');
 }
 
-const base = { caller: 'nestor', label: null, script: 'return 1', args: null, defaults: {}, budgetUsd: 1, resumedFrom: null } as const;
+const base = { caller: 'nestor', label: null, script: 'return 1', args: null, defaults: {}, budgetUsd: 1, budgetTokens: 0, resumedFrom: null } as const;
 
 test('deleteWork empties the work dir and keeps the directory', () => {
   const { dataDir, store } = mkStore();

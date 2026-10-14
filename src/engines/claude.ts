@@ -30,6 +30,7 @@ import { homedir } from 'node:os';
 import { createWriteStream, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Profile } from '../config.js';
+import { looksLikeCodexAgent } from './codex.js';
 
 export interface ClaudeAgentSpec {
   runId: string;
@@ -120,10 +121,15 @@ function priceCeiling(): Price {
   return Object.values(PRICES).reduce((a, b) => (b.out > a.out ? b : a));
 }
 
-export function estimateCost(model: string, u: Record<string, any>): number {
+/** The price row for a model (longest prefix), or null when none is configured. */
+export function priceFor(model: string): Price | null {
   let best = '';
   for (const k of Object.keys(PRICES)) if (model.startsWith(k) && k.length > best.length) best = k;
-  const p = best ? PRICES[best] : priceCeiling();
+  return best ? PRICES[best] : null;
+}
+
+export function estimateCost(model: string, u: Record<string, any>): number {
+  const p = priceFor(model) ?? priceCeiling();
   const w1h = Number(u.cache_creation?.ephemeral_1h_input_tokens ?? 0);
   const wAll = Number(u.cache_creation_input_tokens ?? 0);
   return (Number(u.input_tokens ?? 0) * p.in + Number(u.output_tokens ?? 0) * p.out
@@ -138,6 +144,18 @@ let liveFile: string | null = null;
 function persistLive(): void {
   if (!liveFile) return;
   try { writeFileSync(liveFile, JSON.stringify([...LIVE_GROUPS])); } catch { /* best effort */ }
+}
+
+/** Every engine records its agent's process group here, so shutdown and the
+ *  boot-time reaper see codex agents as well as claude ones. */
+export function trackAgentGroup(pgid: number): void {
+  LIVE_GROUPS.add(pgid);
+  persistLive();
+}
+
+export function untrackAgentGroup(pgid: number): void {
+  LIVE_GROUPS.delete(pgid);
+  persistLive();
 }
 
 export function killAllAgentGroups(sig: NodeJS.Signals = 'SIGKILL'): number {
@@ -158,7 +176,7 @@ export function initLiveGroups(file: string, log: (s: string) => void): void {
     if (!Number.isInteger(pgid) || pgid <= 1) continue;
     let cmd = '';
     try { cmd = execFileSync('ps', ['-o', 'command=', '-p', String(pgid)], { encoding: 'utf8' }); } catch { continue; }
-    if (cmd.includes('claude') && cmd.includes('--output-format=stream-json')) {
+    if ((cmd.includes('claude') && cmd.includes('--output-format=stream-json')) || looksLikeCodexAgent(cmd)) {
       try { process.kill(-pgid, 'SIGKILL'); log(`reaped orphaned agent process group ${pgid}`); } catch { /* gone */ }
     }
   }
@@ -239,7 +257,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
     detached: true, // own process group, so tools it spawned die with it
   });
 
-  if (child.pid !== undefined) { LIVE_GROUPS.add(child.pid); persistLive(); }
+  if (child.pid !== undefined) trackAgentGroup(child.pid);
   let resultEvent: Record<string, unknown> | null = null;
   let harvested: unknown = undefined;
   let lastText = '';
@@ -307,7 +325,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
     const finish = (code: number | null, spawnError?: Error) => {
       if (settled) return;
       settled = true;
-      if (child.pid !== undefined) { LIVE_GROUPS.delete(child.pid); persistLive(); }
+      if (child.pid !== undefined) untrackAgentGroup(child.pid);
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
       out.end();

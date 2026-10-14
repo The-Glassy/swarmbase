@@ -37,14 +37,30 @@ function clip(s: unknown, n: number): string {
   return t.length > n ? t.slice(0, n) + `… [${t.length - n} more chars]` : t;
 }
 
-/** Raw stream-json lines → a compact, renderable transcript. */
+/** Raw engine stream lines (Claude Code stream-json or Codex exec JSONL) → a compact, renderable transcript. */
 export function normalizeTranscript(raw: string): unknown[] {
   const items: unknown[] = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     let e: Record<string, any>;
     try { e = JSON.parse(line); } catch { continue; }
-    if (e.type === 'system' && e.subtype === 'init') {
+    if (e.type === 'thread.started') {
+      items.push({ kind: 'init', model: '', tools: [], cwd: '', engine: 'codex' });
+    } else if (typeof e.type === 'string' && e.type.startsWith('item.') && e.item) {
+      const it = e.item as Record<string, any>;
+      if (e.type !== 'item.completed') continue;
+      if (it.type === 'agent_message') items.push({ kind: 'text', text: clip(it.text ?? '', 20_000) });
+      else if (it.type === 'reasoning') items.push({ kind: 'thinking', text: clip(it.text ?? '', 8_000) });
+      else if (it.type === 'command_execution') {
+        items.push({ kind: 'tool_use', name: 'shell', input: clip(it.command ?? '', 6_000) });
+        items.push({ kind: 'tool_result', text: clip(it.aggregated_output ?? '', 6_000), isError: !!it.exit_code });
+      } else if (it.type === 'error') items.push({ kind: 'tool_result', text: clip(it.message ?? '', 2_000), isError: true });
+      else items.push({ kind: 'tool_use', name: String(it.type), input: clip(it, 6_000) });
+    } else if (e.type === 'turn.completed') {
+      items.push({ kind: 'result', subtype: 'success', usage: e.usage });
+    } else if (e.type === 'turn.failed' || e.type === 'error') {
+      items.push({ kind: 'result', subtype: 'error', usage: null, error: e.error?.message ?? e.message });
+    } else if (e.type === 'system' && e.subtype === 'init') {
       items.push({ kind: 'init', model: e.model, tools: e.tools, cwd: e.cwd });
     } else if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
       for (const b of e.message.content) {
