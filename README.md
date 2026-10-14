@@ -208,7 +208,7 @@ open to the tailnet. Cancel and skip require a `Tailscale-User-Login` listed in 
 
 - Build: `npm install && npm run build`. Run: `node dist/src/index.js`.
 - Service: on macOS, `ops/swarmbase.plist.template` is a launchd template.
-- Disk: a run's `work/` (clones, toolchains, scratch; the bulk of a run on disk) is deleted when the run ends, and the work dirs of ended runs are swept on boot, unless the run was started with `keepWork: true` or the config sets `deleteWorkOnEnd: false`. `resume` starts a fresh run with its own `work/`, so nothing reads the old one.
+- Disk: a run's `work/` (clones, toolchains, scratch; the bulk of a run on disk) is deleted when the run ends, and the work dirs of ended runs are swept on boot, unless the run was started with `keepWork: true` or the config sets `deleteWorkOnEnd: false`. `resume` starts a fresh run with its own `work/`; cached agent results replay as recorded, so one that names a file under the old `work/` points at nothing (keep the run's work, or have the agent return the content).
 - Restart: stops every in-flight subagent. Runs are marked `interrupted` on the next boot, callers are notified, and `resume` replays finished agents for free. If the daemon died uncleanly, leftover agent process groups (claude and codex) are reaped on boot and interrupted runs' throwaway `CODEX_HOME`s are deleted.
 - Tests: `npm test` (the codex engine suite runs its live cases when a Codex CLI is found — `CODEX_BIN` or the usual
   install paths — else skips them). `node test/runner-harness.mjs` exercises the runner sandbox. `node test/client.mjs <caller> <tool> '<json>' [--wait]` is a minimal MCPL host.

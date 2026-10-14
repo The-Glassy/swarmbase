@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     notifier.runEnded(meta);
   }
   if (cfg.deleteWorkOnEnd) {
-    const swept = store.sweepWork();
+    const swept = store.sweepWork((meta, e) => log(`could not delete the work dir of ended run ${meta.id}: ${e.message}`));
     if (swept.length) log(`deleted the work dirs of ${swept.length} ended run(s) left behind (${swept.map((m) => m.id).join(', ')})`);
   }
   const tools = new SwarmTools(cfg, store, runs, notifier);

@@ -181,6 +181,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   cfg.apiBaseUrl = claude.baseUrl;
   cfg.claudeBin = claude.bin;
   cfg.dataDir = expand(cfg.dataDir);
+  if (typeof cfg.deleteWorkOnEnd !== 'boolean') throw new Error('config: deleteWorkOnEnd must be true or false');
   const names = new Set<string>();
   for (const c of cfg.callers) {
     if (names.has(c.name)) throw new Error(`config: duplicate caller "${c.name}"`);

@@ -52,7 +52,7 @@ import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, realp
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { Profile } from '../config.js';
-import { estimateCost, priceFor, trackAgentGroup, untrackAgentGroup, type Activity, type AgentOutcome } from './claude.js';
+import { estimateCost, KILL_GRACE_MS, priceFor, trackAgentGroup, untrackAgentGroup, type Activity, type AgentOutcome } from './claude.js';
 import type { Usage, UsageMeter } from '../meter.js';
 
 export interface CodexAgentSpec {
@@ -423,7 +423,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
     endReason = why;
     endDetail = detail;
     killGroup('SIGTERM');
-    setTimeout(() => killGroup('SIGKILL'), 5000).unref();
+    setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref();
   };
   const onAbort = () => stop('cancelled', '');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });

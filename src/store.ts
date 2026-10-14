@@ -12,7 +12,7 @@
  *   work/          default cwd for subagents
  */
 import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -293,26 +293,60 @@ export class RunStore {
   }
 
   /** Remove everything under the run's `work/` and leave the (empty) directory in place.
-   *  Only ever touches `<run dir>/work`. Returns false when nothing was there. */
+   *  Only ever touches `<run dir>/work`: if an agent replaced `work` itself with a symlink
+   *  it is unlinked, never followed (entries inside are unlinked by rmSync anyway). Trees
+   *  a toolchain left read-only (Go's module cache is 0555) are made writable and retried.
+   *  Returns false when nothing was there. */
   deleteWork(meta: RunMeta): boolean {
     const dir = this.workDir(meta);
-    if (!existsSync(dir)) return false;
+    let st;
+    try { st = lstatSync(dir); } catch { return false; }
+    if (!st.isDirectory()) {
+      rmSync(dir, { force: true });
+      mkdirSync(dir);
+      return true;
+    }
     let hadFiles = false;
     for (const name of readdirSync(dir)) {
       hadFiles = true;
-      rmSync(join(dir, name), { recursive: true, force: true });
+      const p = join(dir, name);
+      try {
+        rmSync(p, { recursive: true, force: true });
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== 'EACCES' && code !== 'EPERM') throw e;
+        makeWritable(p);
+        rmSync(p, { recursive: true, force: true });
+      }
     }
     return hadFiles;
   }
 
   /** Work dirs of runs that have ended and were not started with `keepWork`:
-   *  what a crash or an old build left behind. */
-  sweepWork(): RunMeta[] {
+   *  what a crash or an old build left behind. One run's failure (reported through
+   *  `onError`) never stops the sweep or the boot. */
+  sweepWork(onError: (meta: RunMeta, error: Error) => void = () => {}): RunMeta[] {
     const out: RunMeta[] = [];
     for (const meta of this.metas.values()) {
       if (meta.status === 'running' || meta.keepWork) continue;
-      if (this.deleteWork(meta)) out.push(meta);
+      try {
+        if (this.deleteWork(meta)) out.push(meta);
+      } catch (e) {
+        onError(meta, e as Error);
+      }
     }
     return out;
   }
+}
+
+/** chmod u+rwx every directory under `p` (and `p` itself). lstat-based: symlinks are
+ *  left alone, so nothing outside the tree is touched. Best effort. */
+function makeWritable(p: string): void {
+  let st;
+  try { st = lstatSync(p); } catch { return; }
+  if (!st.isDirectory()) return;
+  try { chmodSync(p, (st.mode & 0o7777) | 0o700); } catch { /* best effort */ }
+  let names: string[] = [];
+  try { names = readdirSync(p); } catch { return; }
+  for (const name of names) makeWritable(join(p, name));
 }

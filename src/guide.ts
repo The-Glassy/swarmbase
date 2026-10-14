@@ -71,7 +71,9 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
 Every non-null agent result is journaled. \`resume\` starts a new run (same script unless you pass an edited one)
 whose agent() calls are answered from that journal when the call matches exactly (prompt + schema + model +
 effort + profile + engine + cwd), so only new or changed calls cost anything. Use it after a failure, a cancel, a daemon
-restart, or to iterate on a script.
+restart, or to iterate on a script. The replay returns the journaled *result*, not the files the agent wrote: the
+old run's scratch dir is gone by then (unless it ran with \`keepWork: true\`), so a result that names a file under it
+points at nothing in the resumed run. Have such an agent return the content, or run it \`fresh: true\`.
 
 ## Patterns
 - Fan out → verify: N finders in parallel, then for each finding K skeptics told to REFUTE; keep what survives.
