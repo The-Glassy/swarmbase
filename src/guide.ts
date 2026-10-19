@@ -1,5 +1,7 @@
+import type { AgentMcp } from './config.js';
+
 /** The authoring reference handed to callers by the `guide` tool. */
-export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; tokensDefault: number; tokensMax: number; maxAgents: number; perRun: number; cwdRoots: string[] }): string {
+export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; tokensDefault: number; tokensMax: number; maxAgents: number; perRun: number; cwdRoots: string[]; agentMcp?: AgentMcp | null }): string {
   const codex = opts.engines.includes('codex');
   return `# SwarmBase — writing a run
 
@@ -37,7 +39,9 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   - \`profile\` — what the subagent may touch. think: no tools. read: Read/Grep/Glob inside its cwd only,
     plus WebFetch/WebSearch. write: + Edit/Write inside its cwd, and Bash. Default read; your maximum is
     "${opts.maxProfile}".${codex ? ` For engine "codex": think = no tools; read = a read-only shell with no network,
-    plus the CLI's web search; write = a shell that may write inside its cwd and has network (git, curl).` : ''}
+    plus the CLI's web search; write = a shell that may write inside its cwd and has network (git, curl).` : ''}${opts.agentMcp ? `
+    Agents with profile ${opts.agentMcp.profiles.map((p) => `"${p}"`).join(' or ')} also get these MCP tools:
+    ${opts.agentMcp.allowedTools.map((t) => `\`${t}\``).join(', ')}.` : ''}
   - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir, which is
     deleted when the run ends (start the run with \`keepWork: true\` to keep it; \`resume\` gets a fresh one).
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.

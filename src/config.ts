@@ -13,6 +13,17 @@ export const PROFILES: readonly Profile[] = ['think', 'read', 'write'];
 export type EngineName = 'claude' | 'codex';
 export const ENGINES: readonly EngineName[] = ['claude', 'codex'];
 
+/** Extra MCP servers for a caller's claude agents (e.g. a browser bridge). The
+ *  config file may hold a secret: it is denied to every agent by path. */
+export interface AgentMcp {
+  /** claude --mcp-config file, used instead of the empty one. */
+  configPath: string;
+  /** Tool names (mcp__<server>__<tool>) added to --tools and --allowedTools. */
+  allowedTools: string[];
+  /** Profiles that get them (default read and write); never think. */
+  profiles: Profile[];
+}
+
 export interface ClaudeEngineConfig {
   /** The Claude Code CLI. */
   bin: string;
@@ -67,6 +78,8 @@ export interface CallerPolicy {
   /** Largest per-run token budget the caller may request. */
   runTokensMax: number;
   maxActiveRuns: number;
+  /** null: agents get no MCP servers. */
+  agentMcp: AgentMcp | null;
 }
 
 export interface Config {
@@ -221,11 +234,30 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
     runTokensDefault: positive('runTokensDefault', c.runTokensDefault ?? 10_000_000),
     runTokensMax: positive('runTokensMax', c.runTokensMax ?? 30_000_000),
     maxActiveRuns: c.maxActiveRuns ?? 3,
+    agentMcp: c.agentMcp ? validateAgentMcp(c.name, engines, c.agentMcp) : null,
   };
   function positive(key: string, v: number): number {
     if (!(Number(v) > 0)) throw new Error(`config: caller ${c.name} ${key} must be a positive number`);
     return Number(v);
   }
+}
+
+const MCP_TOOL_RE = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
+
+function validateAgentMcp(caller: string, engines: EngineName[], m: Partial<AgentMcp>): AgentMcp {
+  // the codex engine has no equivalent wiring yet; refuse rather than silently run its agents without the tools
+  if (engines.includes('codex')) throw new Error(`config: caller ${caller} agentMcp is supported by the claude engine only; drop codex from its engines`);
+  const configPath = typeof m.configPath === 'string' ? expand(m.configPath) : '';
+  if (!isAbsolute(configPath)) throw new Error(`config: caller ${caller} agentMcp.configPath must be an absolute path`);
+  const allowedTools = m.allowedTools;
+  if (!Array.isArray(allowedTools) || !allowedTools.length || !allowedTools.every((t) => typeof t === 'string' && MCP_TOOL_RE.test(t))) {
+    throw new Error(`config: caller ${caller} agentMcp.allowedTools must list MCP tool names (mcp__<server>__<tool>)`);
+  }
+  const profiles = m.profiles ?? ['read', 'write'];
+  if (!Array.isArray(profiles) || !profiles.length || !profiles.every((p) => p === 'read' || p === 'write')) {
+    throw new Error(`config: caller ${caller} agentMcp.profiles may name read and write only`);
+  }
+  return { configPath: resolve(configPath), allowedTools: [...new Set(allowedTools)], profiles: [...new Set(profiles)] };
 }
 
 export function profileRank(p: Profile): number {

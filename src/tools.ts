@@ -121,6 +121,7 @@ export class SwarmTools implements ToolHost {
           maxAgents: this.cfg.maxAgentsPerRun,
           perRun: this.cfg.perRunConcurrency,
           cwdRoots: caller.cwdRoots,
+          agentMcp: caller.agentMcp,
         }));
         default: return text(`Unknown tool: ${name}`, true);
       }

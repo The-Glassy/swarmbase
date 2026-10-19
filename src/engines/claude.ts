@@ -6,7 +6,9 @@
  * (origin=swarmbase, channel=<runId>, counterparty=<n:label>).
  *
  * Isolation (verified with CLI 2.1.287):
- *  - --strict-mcp-config + empty --mcp-config: no MCP servers.
+ *  - --strict-mcp-config + empty --mcp-config: no MCP servers, unless the
+ *    caller's agentMcp names a config for this profile (never think); only its
+ *    listed tools are added to --tools and --allowedTools.
  *  - --setting-sources= (empty): no user/project/local settings, so no hooks,
  *    plugins or env from the operator's config or from a settings dir an agent
  *    planted in its cwd.
@@ -14,7 +16,8 @@
  *    under the agent's cwd (`Read(//<cwd>/**)` also governs Grep/Glob); anything
  *    else is denied. A plain `--allowedTools=Read` lets Read/Grep reach the whole
  *    disk — that was verified to leak a file outside the cwd, hence the scoping.
- *  - --settings deny rules for secrets as defense in depth.
+ *  - --settings deny rules for secrets (and every caller's agentMcp config) as
+ *    defense in depth.
  *  - minimal environment (nothing of the operator's is inherited).
  *  - `write` adds Bash, which is NOT path-confined: trusted callers only.
  *
@@ -29,7 +32,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { createWriteStream, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Profile } from '../config.js';
+import type { AgentMcp, Profile } from '../config.js';
 import { looksLikeCodexAgent } from './codex.js';
 
 export interface ClaudeAgentSpec {
@@ -49,8 +52,12 @@ export interface ClaudeAgentSpec {
   apiBaseUrl: string | null;
   claudeBin: string;
   emptyMcpConfigPath: string;
+  /** The caller's MCP config and tools for this agent, or null (see agentMcpFor). */
+  agentMcp: { configPath: string; allowedTools: string[] } | null;
   /** SwarmBase data dir (realpath), for the deny rules. */
   dataDir: string;
+  /** Files outside the data dir denied by path (every caller's agentMcp config). */
+  denyExtra: string[];
 }
 
 export interface AgentOutcome {
@@ -86,7 +93,7 @@ export function allowRules(profile: Profile, cwd: string): string[] {
  *  Inside the SwarmBase data dir only the secrets and run metadata are denied: a
  *  blanket deny on the data dir would also cover runs/<id>/work, the default cwd,
  *  and deny beats allow (verified: the agent could not read its own work dir). */
-export function denyRules(dataDir: string): string[] {
+export function denyRules(dataDir: string, extra: string[] = []): string[] {
   const h = homedir();
   const d = dataDir.replace(/\/+$/, '');
   return [
@@ -95,6 +102,7 @@ export function denyRules(dataDir: string): string[] {
     `Read(/${h}/.ssh/**)`, `Read(/${h}/.claude/**)`, `Read(/${h}/.claude.json)`,
     `Read(/${h}/.codex/**)`, `Read(/${h}/.portal/**)`, `Read(/${h}/.aws/**)`, `Read(/${h}/.config/**)`,
     'Read(**/.env)', 'Read(**/.env.*)', 'Read(**/*.token)', 'Read(**/*credentials*)',
+    ...extra.map((f) => `Read(/${f})`),
   ];
 }
 
@@ -209,8 +217,15 @@ function clip(s: string, n: number): string {
   return flat.length > n ? flat.slice(0, n - 1) + '…' : flat;
 }
 
+/** The caller's agent MCP servers apply to an agent whose profile they name; think never gets tools. */
+export function agentMcpFor(m: AgentMcp | null, profile: Profile): { configPath: string; allowedTools: string[] } | null {
+  if (!m || profile === 'think' || !m.profiles.includes(profile)) return null;
+  return { configPath: m.configPath, allowedTools: m.allowedTools };
+}
+
 export function buildArgs(spec: ClaudeAgentSpec): string[] {
-  const tools = TOOLS[spec.profile];
+  const mcp = spec.profile === 'think' ? null : spec.agentMcp;
+  const tools = [...TOOLS[spec.profile], ...(mcp?.allowedTools ?? [])];
   const args = [
     '-p',
     '--output-format=stream-json',
@@ -218,13 +233,13 @@ export function buildArgs(spec: ClaudeAgentSpec): string[] {
     `--model=${spec.model}`,
     '--no-session-persistence',
     '--strict-mcp-config',
-    `--mcp-config=${spec.emptyMcpConfigPath}`,
+    `--mcp-config=${mcp?.configPath ?? spec.emptyMcpConfigPath}`,
     '--setting-sources=',
-    `--settings=${JSON.stringify({ permissions: { deny: denyRules(spec.dataDir) } })}`,
+    `--settings=${JSON.stringify({ permissions: { deny: denyRules(spec.dataDir, spec.denyExtra) } })}`,
     '--permission-mode=dontAsk',
     `--tools=${tools.join(',')}`,
   ];
-  const allow = allowRules(spec.profile, spec.cwd);
+  const allow = [...allowRules(spec.profile, spec.cwd), ...(mcp?.allowedTools ?? [])];
   if (allow.length) args.push(`--allowedTools=${allow.join(',')}`);
   if (spec.effort) args.push(`--effort=${spec.effort}`);
   if (spec.schema) args.push(`--json-schema=${JSON.stringify(spec.schema)}`);

@@ -20,7 +20,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { isUnder, profileRank, type CallerPolicy, type Config, type EngineName, type Profile } from './config.js';
-import { killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome, KILL_GRACE_MS } from './engines/claude.js';
+import { agentMcpFor, killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome, KILL_GRACE_MS } from './engines/claude.js';
 import { runCodexAgent, strictSchemaProblem } from './engines/codex.js';
 import type { UsageMeter } from './meter.js';
 import { Semaphore } from './semaphore.js';
@@ -613,7 +613,8 @@ export class RunManager {
           codexBin: codex.bin,
           sandbox: codex.sandbox,
           extraRoBinds: codex.extraRoBinds,
-          denyExtra: [safeRealpath(run.caller.apiKeyFile), this.cfg.configPath].filter((p): p is string => !!p),
+          denyExtra: [safeRealpath(run.caller.apiKeyFile), this.cfg.configPath, ...this.cfg.callers.map((c) => c.agentMcp && safeRealpath(c.agentMcp.configPath))]
+            .filter((p): p is string => !!p),
         }, this.meter!, slot.ac.signal, onActivity);
         if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 against the USD budget (set config.prices to shadow-price it); the run's token budget bounds it` });
         spentTokens = o.tokens;
@@ -624,6 +625,10 @@ export class RunManager {
           apiBaseUrl: this.cfg.engines.claude.baseUrl,
           claudeBin: this.cfg.engines.claude.bin,
           emptyMcpConfigPath: this.emptyMcpConfigPath,
+          agentMcp: agentMcpFor(run.caller.agentMcp, a.profile),
+          // every caller's agent MCP config, as configured and resolved
+          denyExtra: [...new Set(this.cfg.callers.flatMap((c) => c.agentMcp ? [c.agentMcp.configPath, safeRealpath(c.agentMcp.configPath)] : [])
+            .filter((p): p is string => !!p))],
         }, slot.ac.signal, onActivity);
       }
     } catch (e) {

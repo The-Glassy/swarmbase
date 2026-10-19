@@ -172,13 +172,32 @@ Every claude subagent also runs with:
 - `--permission-mode=dontAsk`: anything not allowed is denied, never asked.
 - `--setting-sources=` (empty): no user, project or local settings, so a settings dir planted in the cwd is ignored.
 - `--settings` deny rules for credential directories, `.env` and token files.
-- `--strict-mcp-config` with an empty MCP config.
+- `--strict-mcp-config` with an empty MCP config, unless the caller has `agentMcp` (below).
 - `--no-session-persistence`.
 - A minimal environment.
 
 Its cwd is the run's `work/` dir unless the caller's policy allows another; the path is realpath-pinned. A plain
 `--allowedTools=Read` was verified to let Read and Grep reach files outside the cwd, which is why the rules are
 path-scoped.
+
+### Agent MCP servers (`agentMcp`, optional, claude engine only)
+
+A caller's claude subagents can be given MCP servers, e.g. a browser bridge:
+
+```jsonc
+"agentMcp": {
+  "configPath": "~/.swarmbase/resident-a-mcp.json",           // a claude --mcp-config file, absolute (or ~/)
+  "allowedTools": ["mcp__browser__navigate", "mcp__browser__read"],  // exact mcp__<server>__<tool> names
+  "profiles": ["read", "write"]                               // the default; think never gets MCP tools
+}
+```
+
+For an agent whose profile is listed, `--mcp-config` points at that file instead of the empty one (still with
+`--strict-mcp-config`), and only the listed tools are added to `--tools` and `--allowedTools`; any other tool the
+servers expose stays unavailable. The file may hold a secret (a server's token), so every caller's `configPath` is
+added to every claude agent's deny rules and to every codex agent's deny-list. Without `agentMcp` nothing changes.
+The `guide` tool tells the caller which tools its agents get. Codex agents have no equivalent yet: a caller with
+`agentMcp` must not list `codex` in its `engines` (config load fails otherwise).
 
 ## Budget
 
