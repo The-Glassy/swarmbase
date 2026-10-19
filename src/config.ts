@@ -243,12 +243,19 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
 }
 
 const MCP_TOOL_RE = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
+/** Pattern characters: the config path becomes a deny rule, which would then match something else. */
+const GLOB_CHARS_RE = /[*?[\]{}\\]/;
 
 function validateAgentMcp(caller: string, engines: EngineName[], m: Partial<AgentMcp>): AgentMcp {
   // the codex engine has no equivalent wiring yet; refuse rather than silently run its agents without the tools
   if (engines.includes('codex')) throw new Error(`config: caller ${caller} agentMcp is supported by the claude engine only; drop codex from its engines`);
   const configPath = typeof m.configPath === 'string' ? expand(m.configPath) : '';
   if (!isAbsolute(configPath)) throw new Error(`config: caller ${caller} agentMcp.configPath must be an absolute path`);
+  let real = configPath;
+  try { real = realpathSync(configPath); } catch { /* not there yet */ }
+  if (GLOB_CHARS_RE.test(configPath) || GLOB_CHARS_RE.test(real)) {
+    throw new Error(`config: caller ${caller} agentMcp.configPath may not contain * ? [ ] { } or \\ (it is denied to agents by a path pattern)`);
+  }
   const allowedTools = m.allowedTools;
   if (!Array.isArray(allowedTools) || !allowedTools.length || !allowedTools.every((t) => typeof t === 'string' && MCP_TOOL_RE.test(t))) {
     throw new Error(`config: caller ${caller} agentMcp.allowedTools must list MCP tool names (mcp__<server>__<tool>)`);

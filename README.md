@@ -186,7 +186,7 @@ A caller's claude subagents can be given MCP servers, e.g. a browser bridge:
 
 ```jsonc
 "agentMcp": {
-  "configPath": "~/.swarmbase/resident-a-mcp.json",           // a claude --mcp-config file, absolute (or ~/)
+  "configPath": "~/.swarmbase/resident-a-mcp.json",           // a claude --mcp-config file, absolute (or ~/), no glob characters
   "allowedTools": ["mcp__browser__navigate", "mcp__browser__read"],  // exact mcp__<server>__<tool> names
   "profiles": ["read", "write"]                               // the default; think never gets MCP tools
 }

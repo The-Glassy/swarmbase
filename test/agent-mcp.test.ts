@@ -4,6 +4,7 @@
  * the deny rule for the config file.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -37,12 +38,23 @@ test('config: agentMcp is optional, defaults to read and write, and is validated
     assert.throws(() => parseConfig({ callers: [{ ...caller, engines, agentMcp }] } as any), re);
   bad({ ...mcp, configPath: 'mcp.json' }, /configPath must be an absolute path/);
   bad({ allowedTools: mcp.allowedTools }, /configPath must be an absolute path/);
+  bad({ ...mcp, configPath: '/srv/r/mcp[prod].json' }, /may not contain/);
+  bad({ ...mcp, configPath: '/srv/r/*.json' }, /may not contain/);
   bad({ ...mcp, allowedTools: [] }, /allowedTools must list MCP tool names/);
   bad({ ...mcp, allowedTools: ['Bash'] }, /allowedTools must list MCP tool names/);
   bad({ ...mcp, allowedTools: ['mcp__browser__navigate,Bash'] }, /allowedTools must list MCP tool names/);
   bad({ ...mcp, profiles: ['think'] }, /profiles may name read and write only/);
   bad({ ...mcp, profiles: [] }, /profiles may name read and write only/);
   bad(mcp, /claude engine only/, ['claude', 'codex']);
+  // a plain path that resolves to a patterned one is refused too
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-mcp-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'mcp[x].json'), '{}');
+    fs.symlinkSync(path.join(dir, 'mcp[x].json'), path.join(dir, 'mcp.json'));
+    bad({ ...mcp, configPath: path.join(dir, 'mcp.json') }, /may not contain/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('buildArgs: without agentMcp the agent gets the empty MCP config and the profile tools only', () => {
