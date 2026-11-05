@@ -118,7 +118,10 @@ export function createDashboard(
     const msg = who ? `${who} is not on this dashboard's viewer list` : 'no tailnet user identity';
     if (api) return json(res, 403, { error: msg });
     res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    res.end(`SwarmBase: ${msg}. Ask the operator to add your login to dashboard.viewerLogins.\n`);
+    const next = who
+      ? "Ask the operator to add your login to dashboard.viewerLogins."
+      : 'Open it as a tailnet user through tailscale serve; a direct or tunnelled connection has no identity.';
+    res.end(`SwarmBase: ${msg}. ${next}\n`);
   };
 
   const serveStatic = (res: ServerResponse, file: string): void => {
@@ -155,10 +158,10 @@ export function createDashboard(
       res.write(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`);
     };
     unsubscribe = store.subscribe(runId, write); // subscribe first, then backfill: no gap
+    req.on('close', close); // before the backfill, which can throw
     for (const e of store.readEvents(runId, since)) write(e);
     if (closed) return;
     ka = setInterval(() => { if (allowed()) res.write(': ka\n\n'); }, 20_000);
-    req.on('close', close);
   };
 
   // DNS-rebinding guard: only our own names may address this server.
@@ -237,7 +240,10 @@ export function createDashboard(
       }
       res.writeHead(405).end('method not allowed');
     } catch (e) {
-      json(res, 500, { error: (e as Error).message });
+      // A stream or static file can fail after its headers went out. A second writeHead
+      // would throw out of here, to uncaughtException, which stops every running agent.
+      if (res.headersSent) res.destroy();
+      else json(res, 500, { error: (e as Error).message });
     }
   };
 }

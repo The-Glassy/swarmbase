@@ -54,6 +54,7 @@ function call(path: string, headers: Record<string, string> = {}, method = 'GET'
       res.setEncoding('utf8');
       res.on('data', (c) => { body += c; });
       res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+      res.on('error', reject);
     });
     // An event stream that should have been refused would otherwise hang the suite, not fail it.
     req.setTimeout(5000, () => req.destroy(new Error(`${method} ${path}: no complete response within 5 s`)));
@@ -114,6 +115,24 @@ test('a request target the URL parser refuses is a 400, and the daemon survives 
     assert.equal((await call(target)).status, 400, target);
   }
   assert.equal((await call('/api/health')).status, 200);
+});
+
+test('a read failing after the headers went out ends that response, not the daemon', async () => {
+  const real = store.readEvents;
+  store.readEvents = () => { throw new Error('simulated EMFILE'); };
+  try {
+    await assert.rejects(call(`/api/runs/${meta.id}/events`, as(VIEWER)));
+  } finally {
+    store.readEvents = real;
+  }
+  assert.equal((await call('/api/health')).status, 200);
+});
+
+test('the denial page gives advice that can help the person reading it', async () => {
+  assert.match((await call('/', as(STRANGER))).body, /add your login/);
+  const noIdentity = (await call('/')).body;
+  assert.match(noIdentity, /no tailnet user identity/);
+  assert.doesNotMatch(noIdentity, /add your login/);
 });
 
 test('a viewer taken off the lists loses an event stream already open', async () => {
@@ -205,6 +224,10 @@ test('list changes apply without a restart, and a bad edit keeps the last good l
     const logs: string[] = [];
     const get = watchDashboardAccess(path, { viewerLogins: [VIEWER], adminLogins: [ADMIN] }, (l) => logs.push(l));
     assert.deepEqual(get().viewerLogins, [VIEWER]);
+
+    // An edit made after the boot read, before the first request, still counts.
+    const staleBoot = watchDashboardAccess(path, { viewerLogins: [STRANGER], adminLogins: [] }, () => {});
+    assert.deepEqual(staleBoot().viewerLogins, [VIEWER]);
 
     write(JSON.stringify({ dashboard: { viewerLogins: [], adminLogins: [ADMIN] } }), t0 + 5000);
     assert.deepEqual(get().viewerLogins, [], 'a removed viewer loses access');

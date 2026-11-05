@@ -151,7 +151,8 @@ function parseDashboard(raw: unknown): DashboardAccess {
  */
 export function watchDashboardAccess(path: string, initial: DashboardAccess, log: (line: string) => void): () => DashboardAccess {
   let current = initial;
-  let mtimeMs = (() => { try { return statSync(path).mtimeMs; } catch { return 0; } })();
+  // The first request always re-reads: `initial` may predate an edit made during boot.
+  let mtimeMs = -1;
   return () => {
     let m: number;
     try { m = statSync(path).mtimeMs; } catch { return current; }
