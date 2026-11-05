@@ -141,9 +141,11 @@ test('the extend tool: only your own running run, by a sane amount, and status s
   const caller = cfg.callers[0];
   const { meta, done } = start(fanOut(1, 1));
 
+  const before = Date.parse(store.get(meta.id)!.deadlineAt!);
   const moved = await tools.callTool(caller, 'extend', { runId: meta.id, hours: 2 });
   assert.ok(!moved.isError);
   assert.match(moved.content[0].text, /now has until/);
+  assert.equal(Date.parse(store.get(meta.id)!.deadlineAt!), before + 2 * 3_600_000);
   assert.match((await tools.callTool(caller, 'status', { runId: meta.id })).content[0].text, new RegExp(`Deadline: ${store.get(meta.id)!.deadlineAt}`));
 
   const agreed = store.get(meta.id)!.deadlineAt;
