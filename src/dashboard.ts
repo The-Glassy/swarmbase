@@ -1,15 +1,18 @@
 /**
  * Dashboard HTTP API + static pages. Bound to 127.0.0.1 and published on the
- * tailnet with `tailscale serve --https=<port>` (never Funnel). Viewing is
- * open to the tailnet; cancel/skip need a Tailscale-User-Login listed in
- * config.dashboard.adminLogins AND an `X-SwarmBase: 1` header (a custom header
- * forces a CORS preflight we never answer, so other sites can't CSRF it).
+ * tailnet with `tailscale serve --https=<port>` (never Funnel). Being on the
+ * tailnet is NOT enough to view: every page, API route and event stream needs a
+ * Tailscale-User-Login listed in config.dashboard.viewerLogins or adminLogins
+ * (deny by default; requests with no identity, e.g. from tagged nodes, are
+ * refused). Only /api/health (counts) and /api/whoami answer anyone. Cancel/skip
+ * additionally need an admin login AND an `X-SwarmBase: 1` header (a custom
+ * header forces a CORS preflight we never answer, so other sites can't CSRF it).
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Config } from './config.js';
+import type { Config, DashboardAccess } from './config.js';
 import type { Notifier } from './notifier.js';
 import type { RunManager } from './runs.js';
 import type { RunStore } from './store.js';
@@ -28,8 +31,11 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function login(req: IncomingMessage): string | null {
+  // tailscale serve strips any client-sent copy of this header and sets it from
+  // the peer's node identity; it is absent for tagged nodes and Funnel traffic.
+  if (req.headers['tailscale-funnel-request'] !== undefined) return null;
   const v = req.headers['tailscale-user-login'];
-  return typeof v === 'string' && v ? v : null;
+  return typeof v === 'string' && v.trim() ? v.trim().toLowerCase() : null;
 }
 
 function clip(s: unknown, n: number): string {
@@ -83,10 +89,26 @@ export function normalizeTranscript(raw: string): unknown[] {
   return items;
 }
 
-export function createDashboard(cfg: Config, store: RunStore, runs: RunManager, notifier: Notifier) {
+export function createDashboard(
+  cfg: Config, store: RunStore, runs: RunManager, notifier: Notifier,
+  access: () => DashboardAccess = () => cfg.dashboard,
+) {
   const isAdmin = (req: IncomingMessage): boolean => {
     const who = login(req);
-    return !!who && cfg.dashboard.adminLogins.includes(who);
+    return !!who && access().adminLogins.includes(who);
+  };
+  const isViewer = (req: IncomingMessage): boolean => {
+    const who = login(req);
+    if (!who) return false;
+    const a = access();
+    return a.viewerLogins.includes(who) || a.adminLogins.includes(who);
+  };
+  const deny = (req: IncomingMessage, res: ServerResponse, api: boolean): void => {
+    const who = login(req);
+    const msg = who ? `${who} is not on this dashboard's viewer list` : 'no tailnet user identity';
+    if (api) return json(res, 403, { error: msg });
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(`SwarmBase: ${msg}. Ask the operator to add your login to dashboard.viewerLogins.\n`);
   };
 
   const serveStatic = (res: ServerResponse, file: string): void => {
@@ -124,13 +146,19 @@ export function createDashboard(cfg: Config, store: RunStore, runs: RunManager, 
     const url = new URL(req.url ?? '/', 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean);
     try {
+      // Content-free routes, open to any caller that passed the Host check.
+      if (req.method === 'GET' && parts[0] === 'api' && parts.length === 2) {
+        if (parts[1] === 'whoami') return json(res, 200, { login: login(req), viewer: isViewer(req), admin: isAdmin(req) });
+        if (parts[1] === 'health') return json(res, 200, { ok: true, ...runs.stats() });
+      }
+      // Everything else — pages, run list, scripts, args, prompts, transcripts, results, SSE, actions.
+      if (!isViewer(req)) return deny(req, res, parts[0] === 'api');
+
       if (req.method === 'GET') {
         if (parts.length === 0) return serveStatic(res, 'index.html');
         if (parts[0] === 'runs' && parts.length === 2) return serveStatic(res, 'run.html');
         if (parts[0] === 'static' && parts.length === 2) return serveStatic(res, parts[1]);
         if (parts[0] === 'api') {
-          if (parts[1] === 'whoami') return json(res, 200, { login: login(req), admin: isAdmin(req) });
-          if (parts[1] === 'health') return json(res, 200, { ok: true, ...runs.stats() });
           if (parts[1] === 'runs' && parts.length === 2) {
             return json(res, 200, {
               stats: runs.stats(),

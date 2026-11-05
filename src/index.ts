@@ -3,7 +3,7 @@
  * SwarmBase daemon — workflow orchestration for Connectome residents, as an MCPL server.
  *
  *   ws://127.0.0.1:<port>/mcpl?token=<caller token>   MCPL (one session per caller)
- *   http://127.0.0.1:<port>/                            dashboard (tailscale serve → tailnet)
+ *   http://127.0.0.1:<port>/                            dashboard (tailscale serve → tailnet; viewer allowlist)
  *
  * Config: ~/.swarmbase/config.json (SWARMBASE_CONFIG overrides).
  */
@@ -11,7 +11,7 @@ import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdirSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
-import { loadConfig } from './config.js';
+import { DEFAULT_CONFIG_PATH, loadConfig, watchDashboardAccess } from './config.js';
 import { createDashboard } from './dashboard.js';
 import { addPrices, ensureEmptyMcpConfig, initLiveGroups } from './engines/claude.js';
 import { bwrapAvailable } from './engines/codex.js';
@@ -28,7 +28,8 @@ function log(line: string): void {
 }
 
 async function main(): Promise<void> {
-  const cfg = loadConfig();
+  const configPath = process.env.SWARMBASE_CONFIG ?? DEFAULT_CONFIG_PATH;
+  const cfg = loadConfig(configPath);
   mkdirSync(cfg.dataDir, { recursive: true, mode: 0o700 });
   addPrices(cfg.prices);
   initLiveGroups(join(cfg.dataDir, 'live-agents.json'), log); // reap a crashed predecessor's agents
@@ -55,7 +56,8 @@ async function main(): Promise<void> {
   const tools = new SwarmTools(cfg, store, runs, notifier);
   const byHash = new Map(cfg.callers.map((c) => [c.tokenSha256, c]));
 
-  const http = createServer(createDashboard(cfg, store, runs, notifier));
+  const dashboardAccess = watchDashboardAccess(configPath, cfg.dashboard, log);
+  const http = createServer(createDashboard(cfg, store, runs, notifier, dashboardAccess));
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
   http.on('upgrade', (req, socket, head) => {
