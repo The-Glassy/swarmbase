@@ -69,6 +69,14 @@ export interface CallerPolicy {
   maxActiveRuns: number;
 }
 
+export interface DashboardAccess {
+  /** Tailscale logins (Tailscale-User-Login header) allowed to view runs, prompts and transcripts.
+   *  Admins can always view. Everyone else, including requests with no identity, is refused. */
+  viewerLogins: string[];
+  /** Tailscale logins allowed to view AND cancel/skip. */
+  adminLogins: string[];
+}
+
 export interface Config {
   host: string;
   port: number;
@@ -95,10 +103,7 @@ export interface Config {
   /** Extra/override model price rows (USD per MTok) for estimating killed agents' spend
    *  (and all of a codex agent's spend: the Codex CLI reports tokens, not cost). */
   prices?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; cacheWrite1h: number }>;
-  dashboard: {
-    /** Tailscale logins (Tailscale-User-Login header) allowed to cancel/skip. */
-    adminLogins: string[];
-  };
+  dashboard: DashboardAccess;
   callers: CallerPolicy[];
 }
 
@@ -121,14 +126,53 @@ const DEFAULTS: Omit<Config, 'callers'> = {
     codex: { bin: 'codex', baseUrl: null, sandbox: 'bwrap', maxTokensDefault: 3_000_000, maxTokensMax: 3_000_000, extraRoBinds: [] },
   },
   deleteWorkOnEnd: true,
-  dashboard: { adminLogins: [] },
+  dashboard: { viewerLogins: [], adminLogins: [] },
 };
+
+export const DEFAULT_CONFIG_PATH = join(homedir(), '.swarmbase', 'config.json');
+
+function loginList(v: unknown, field: string): string[] {
+  if (v === undefined) return [];
+  if (!Array.isArray(v) || !v.every((x) => typeof x === 'string' && x.trim())) {
+    throw new Error(`config: dashboard.${field} must be an array of logins`);
+  }
+  return v.map((x: string) => x.trim().toLowerCase());
+}
+
+function parseDashboard(raw: unknown): DashboardAccess {
+  const d = (raw ?? {}) as Record<string, unknown>;
+  return { viewerLogins: loginList(d.viewerLogins, 'viewerLogins'), adminLogins: loginList(d.adminLogins, 'adminLogins') };
+}
+
+/**
+ * Dashboard access lists, re-read from the config file whenever its mtime
+ * changes, so adding or removing a viewer needs no restart (a restart kills
+ * in-flight agents). A file that fails to parse keeps the last good lists.
+ */
+export function watchDashboardAccess(path: string, initial: DashboardAccess, log: (line: string) => void): () => DashboardAccess {
+  let current = initial;
+  // The first request always re-reads: `initial` may predate an edit made during boot.
+  let mtimeMs = -1;
+  return () => {
+    let m: number;
+    try { m = statSync(path).mtimeMs; } catch { return current; }
+    if (m === mtimeMs) return current;
+    mtimeMs = m;
+    try {
+      current = parseDashboard((JSON.parse(readFileSync(path, 'utf8')) as Partial<Config>).dashboard);
+      log(`dashboard access reloaded: ${current.viewerLogins.length} viewer(s), ${current.adminLogins.length} admin(s)`);
+    } catch (e) {
+      log(`dashboard access reload failed, keeping previous lists: ${(e as Error).message}`);
+    }
+    return current;
+  };
+}
 
 function expand(p: string): string {
   return p.startsWith('~/') ? join(homedir(), p.slice(2)) : p;
 }
 
-export function loadConfig(path = process.env.SWARMBASE_CONFIG ?? join(homedir(), '.swarmbase', 'config.json')): Config {
+export function loadConfig(path = process.env.SWARMBASE_CONFIG ?? DEFAULT_CONFIG_PATH): Config {
   const cfg = parseConfig(JSON.parse(readFileSync(path, 'utf8')) as Partial<Config>);
   cfg.configPath = resolve(path);
   return cfg;
@@ -175,7 +219,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
     ...DEFAULTS,
     ...raw,
     engines: { claude, codex },
-    dashboard: { ...DEFAULTS.dashboard, ...(raw.dashboard ?? {}) },
+    dashboard: parseDashboard(raw.dashboard),
     callers: (raw.callers ?? []).map(validateCaller),
   };
   cfg.apiBaseUrl = claude.baseUrl;

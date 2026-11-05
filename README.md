@@ -70,7 +70,10 @@ so no host-realm object is reachable from the script. A watchdog fails a run who
                 "sandbox": "bwrap", "maxTokensDefault": 3000000, "maxTokensMax": 3000000 }   // a bare bin name is resolved on PATH at start
   },
   "maxConcurrentAgents": 10, "perRunConcurrency": 8, "maxAgentsPerRun": 200,
-  "dashboard": { "adminLogins": ["you@example.com"] },         // may cancel runs and skip agents
+  "dashboard": {
+    "viewerLogins": ["colleague@example.com"],                 // may view runs, prompts, transcripts
+    "adminLogins": ["you@example.com"]                         // may view, cancel runs and skip agents
+  },
   "callers": [{
     "name": "resident-a",
     "tokenSha256": "<sha256 of the caller's MCPL token>",      // the token itself is never stored here
@@ -203,9 +206,17 @@ The daemon serves an HTTP dashboard on the same port:
 - A page per run with per-phase agent rows, live over SSE.
 - Per-agent prompt and transcript drill-down.
 
-Publish it tailnet-only with `tailscale serve --bg --https=7360 http://127.0.0.1:7360`; never use Funnel. Viewing is
-open to the tailnet. Cancel and skip require a `Tailscale-User-Login` listed in `dashboard.adminLogins` plus an
-`X-SwarmBase: 1` header, which blocks cross-site POSTs. A Host allowlist blocks DNS rebinding.
+Publish it tailnet-only with `tailscale serve --bg --https=7360 http://127.0.0.1:7360`; never use Funnel.
+
+Being on the tailnet is not enough to view. The dashboard shows subagent prompts, transcripts, scripts and results, so
+every page, API route and event stream requires a `Tailscale-User-Login` listed in `dashboard.viewerLogins` or
+`dashboard.adminLogins`. Everyone else gets a 403, including tagged nodes and Funnel traffic, which carry no user
+identity. Only `/api/health` (run counts) and `/api/whoami` answer anyone. Both lists are re-read when the config file
+changes, so adding or removing a viewer needs no restart. A file that fails to parse keeps the last good lists, so
+after removing someone, check the log for `dashboard access reloaded`.
+
+Cancel and skip require an admin login plus an `X-SwarmBase: 1` header, which blocks cross-site POSTs. A Host
+allowlist blocks DNS rebinding.
 
 ## Ops
 
@@ -227,4 +238,4 @@ open to the tailnet. Cancel and skip require a `Tailscale-User-Login` listed in 
   not metered at all (the CLI's usage comes only with the terminal event); the gap is bounded by one response.
 - `isolation: 'worktree'` and `workflow()` nesting aren't implemented and fail loudly.
 - The runner sandbox is defense in depth. Node 20's permission model doesn't restrict network.
-- The dashboard trusts `Tailscale-User-Login`. A local process running as the same user could forge it, but it could also read `~/.swarmbase` directly.
+- The dashboard trusts `Tailscale-User-Login`, which `tailscale serve` sets itself and strips from clients. That holds only through serve: anything reaching the port directly can send the header. So keep `host` on loopback. A process on the machine can still forge a listed login, and that includes a subagent shell with network, even a wrapped codex shell that can't read `~/.swarmbase`. It's one more reason `write` is for trusted callers only.

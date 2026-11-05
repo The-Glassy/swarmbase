@@ -31,12 +31,12 @@ async function postJSON(url) {
   if (!r.ok) throw new Error(body.error || r.status);
   return body;
 }
-let WHO = { login: null, admin: false };
+let WHO = { login: null, viewer: false, admin: false };
 async function showWho() {
   try {
     WHO = await getJSON('/api/whoami');
     const el = document.getElementById('who');
-    if (el) el.textContent = WHO.login ? `${WHO.login}${WHO.admin ? ' · admin' : ''}` : 'no tailnet identity (read-only)';
+    if (el) el.textContent = WHO.login ? `${WHO.login}${WHO.admin ? ' · admin' : ''}` : 'no tailnet identity';
   } catch { /* ignore */ }
   return WHO;
 }
