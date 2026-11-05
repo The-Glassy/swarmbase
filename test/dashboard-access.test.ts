@@ -55,6 +55,8 @@ function call(path: string, headers: Record<string, string> = {}, method = 'GET'
       res.on('data', (c) => { body += c; });
       res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
     });
+    // An event stream that should have been refused would otherwise hang the suite, not fail it.
+    req.setTimeout(5000, () => req.destroy(new Error(`${method} ${path}: no complete response within 5 s`)));
     req.on('error', reject);
     req.end();
   });
@@ -96,8 +98,54 @@ test('viewers and admins can read a run', async () => {
   }
 });
 
-test('logins compare without regard to case or surrounding space', async () => {
-  assert.equal((await call('/api/runs', as('  Viewer@Example.COM '))).status, 200);
+test('logins compare without regard to case, on either side', async () => {
+  assert.equal((await call('/api/runs', as('Viewer@Example.COM'))).status, 200);
+  assert.deepEqual(parseConfig({ dashboard: { viewerLogins: [' Mixed@Example.COM '], adminLogins: [] } }).dashboard.viewerLogins, ['mixed@example.com']);
+});
+
+test('a login close to a listed one is not on the list', async () => {
+  for (const near of ['aviewer@example.com', 'viewer@example.com.evil.test', 'viewer@example.co', 'viewer', '@example.com']) {
+    assert.equal((await call('/api/runs', as(near))).status, 403, near);
+  }
+});
+
+test('a request target the URL parser refuses is a 400, and the daemon survives it', async () => {
+  for (const target of ['//', '//[', '//@']) {
+    assert.equal((await call(target)).status, 400, target);
+  }
+  assert.equal((await call('/api/health')).status, 200);
+});
+
+test('a viewer taken off the lists loses an event stream already open', async () => {
+  const before = 'sent while still on the list';
+  const removed = 'sent after removal';
+  let body = '';
+  const ended = new Promise<void>((resolve, reject) => {
+    const req = request(
+      { host: '127.0.0.1', port, path: `/api/runs/${meta.id}/events`, headers: { host: `127.0.0.1:${cfg.port}`, ...as(VIEWER) } },
+      (res) => {
+        assert.equal(res.statusCode, 200);
+        res.setEncoding('utf8');
+        res.on('data', (c) => { body += c; });
+        res.on('end', resolve);
+        res.once('data', () => {
+          store.emit(meta.id, { type: 'log', message: before });
+          access = { viewerLogins: [], adminLogins: [ADMIN] };
+          store.emit(meta.id, { type: 'log', message: removed });
+        });
+      },
+    );
+    req.setTimeout(5000, () => req.destroy(new Error('the stream stayed open after removal')));
+    req.on('error', reject);
+    req.end();
+  });
+  try {
+    await ended;
+  } finally {
+    access = cfg.dashboard;
+  }
+  assert.ok(body.includes(before), 'the stream was delivering before the removal');
+  assert.ok(!body.includes(removed), 'nothing is delivered after the removal');
 });
 
 test('Funnel traffic has no identity, whatever login it presents', async () => {

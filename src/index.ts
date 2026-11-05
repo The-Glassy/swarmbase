@@ -12,7 +12,7 @@ import { createServer } from 'node:http';
 import { mkdirSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { DEFAULT_CONFIG_PATH, loadConfig, watchDashboardAccess } from './config.js';
-import { createDashboard } from './dashboard.js';
+import { createDashboard, requestUrl } from './dashboard.js';
 import { addPrices, ensureEmptyMcpConfig, initLiveGroups } from './engines/claude.js';
 import { bwrapAvailable } from './engines/codex.js';
 import { UsageMeter } from './meter.js';
@@ -61,8 +61,8 @@ async function main(): Promise<void> {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
   http.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    if (url.pathname !== '/mcpl') { socket.destroy(); return; }
+    const url = requestUrl(req);
+    if (url?.pathname !== '/mcpl') { socket.destroy(); return; }
     const token = url.searchParams.get('token') ?? '';
     const caller = token ? byHash.get(createHash('sha256').update(token).digest('hex')) : undefined;
     if (!caller) {

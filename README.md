@@ -237,4 +237,4 @@ allowlist blocks DNS rebinding.
   not metered at all (the CLI's usage comes only with the terminal event); the gap is bounded by one response.
 - `isolation: 'worktree'` and `workflow()` nesting aren't implemented and fail loudly.
 - The runner sandbox is defense in depth. Node 20's permission model doesn't restrict network.
-- The dashboard trusts `Tailscale-User-Login`. A local process running as the same user could forge it, but it could also read `~/.swarmbase` directly.
+- The dashboard trusts `Tailscale-User-Login`, which `tailscale serve` sets itself and strips from clients. That holds only through serve: anything reaching the port directly can send the header. So keep `host` on loopback. A process on the machine can still forge a listed login, and that includes a subagent shell with network, even a wrapped codex shell that can't read `~/.swarmbase`. It's one more reason `write` is for trusted callers only.

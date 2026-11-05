@@ -30,6 +30,16 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+/** A request target `new URL` refuses ("//", "//[") is the client's error. Thrown outside a
+ *  handler's try it would reach uncaughtException, which stops every running agent. */
+export function requestUrl(req: IncomingMessage): URL | null {
+  try {
+    return new URL(req.url ?? '/', 'http://localhost');
+  } catch {
+    return null;
+  }
+}
+
 function login(req: IncomingMessage): string | null {
   // tailscale serve strips any client-sent copy of this header and sets it from
   // the peer's node identity; it is absent for tagged nodes and Funnel traffic.
@@ -122,15 +132,33 @@ export function createDashboard(
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' });
     res.write(': hello\n\n');
     let last = since;
+    let closed = false;
+    let ka: ReturnType<typeof setInterval> | undefined;
+    let unsubscribe = (): void => {};
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(ka);
+      unsubscribe();
+      res.end();
+    };
+    // This response can stay open for hours, so a viewer taken off the lists loses it too:
+    // at the next event, or within one keepalive on a quiet run.
+    const allowed = (): boolean => {
+      if (isViewer(req)) return true;
+      close();
+      return false;
+    };
     const write = (e: { seq: number }) => {
-      if (e.seq <= last) return;
+      if (closed || e.seq <= last || !allowed()) return;
       last = e.seq;
       res.write(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`);
     };
-    const unsubscribe = store.subscribe(runId, write); // subscribe first, then backfill: no gap
+    unsubscribe = store.subscribe(runId, write); // subscribe first, then backfill: no gap
     for (const e of store.readEvents(runId, since)) write(e);
-    const ka = setInterval(() => res.write(': ka\n\n'), 20_000);
-    req.on('close', () => { clearInterval(ka); unsubscribe(); });
+    if (closed) return;
+    ka = setInterval(() => { if (allowed()) res.write(': ka\n\n'); }, 20_000);
+    req.on('close', close);
   };
 
   // DNS-rebinding guard: only our own names may address this server.
@@ -143,7 +171,8 @@ export function createDashboard(
 
   return (req: IncomingMessage, res: ServerResponse): void => {
     if (!allowedHosts.has(String(req.headers.host ?? ''))) { res.writeHead(421).end('misdirected request'); return; }
-    const url = new URL(req.url ?? '/', 'http://localhost');
+    const url = requestUrl(req);
+    if (!url) { res.writeHead(400).end('bad request'); return; }
     const parts = url.pathname.split('/').filter(Boolean);
     try {
       // Content-free routes, open to any caller that passed the Host check.
