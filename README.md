@@ -26,6 +26,7 @@ Why it's a daemon and not a host module:
 | `status` | phases, each agent's state and cost, recent log lines |
 | `result` | the return value, paged |
 | `cancel` | stop a run (finished agent results stay cached) |
+| `extend` | push a running run's deadline back: `{runId, hours}` |
 | `list` | the caller's recent runs |
 | `resume` | re-run a script; identical agent() calls that already succeeded replay from the journal for free |
 | `guide` | the authoring reference (`src/guide.ts`) |
@@ -70,6 +71,8 @@ so no host-realm object is reachable from the script. A watchdog fails a run who
                 "sandbox": "bwrap", "maxTokensDefault": 3000000, "maxTokensMax": 3000000 }   // a bare bin name is resolved on PATH at start
   },
   "maxConcurrentAgents": 10, "perRunConcurrency": 8, "maxAgentsPerRun": 200,
+  "runTimeoutMs": 86400000,                                     // a run's deadline; callers push it back with `extend`
+  "agentTimeoutMs": null,                                       // default: none, the run's deadline still ends an agent
   "dashboard": {
     "viewerLogins": ["colleague@example.com"],                 // may view runs, prompts, transcripts
     "adminLogins": ["you@example.com"]                         // may view, cancel runs and skip agents
@@ -188,7 +191,7 @@ path-scoped.
 
 ## Budget
 
-Each started agent reserves its cap, `opts.maxUsd` (default `max($0.50, budget/8)`), and runs with
+Each started agent reserves its cap, `opts.maxUsd` (default `max($0.50, budget/8)`, at most $10,000), and runs with
 `--max-budget-usd=<cap>`. Spend is settled when the agent ends and the unused reservation is returned. An agent that
 can't reserve at least $0.03 waits while others hold reservations; when nothing can free up, `agent()` throws.
 Overshoot is bounded by one model turn per running agent. Killed agents (skip, cancel, timeout) are costed from the
@@ -238,4 +241,5 @@ allowlist blocks DNS rebinding.
   not metered at all (the CLI's usage comes only with the terminal event); the gap is bounded by one response.
 - `isolation: 'worktree'` and `workflow()` nesting aren't implemented and fail loudly.
 - The runner sandbox is defense in depth. Node 20's permission model doesn't restrict network.
+- On a machine without a tailnet tag, a request to its own tailnet name carries its owner's login, with no forging needed. Subagents' `WebFetch` is denied every `*.ts.net` host for this reason, but a `write` agent's Bash isn't confined. Tag the host if that matters to you: its own connections then carry no identity.
 - The dashboard trusts `Tailscale-User-Login`, which `tailscale serve` sets itself and strips from clients. That holds only through serve: anything reaching the port directly can send the header. So keep `host` on loopback. A process on the machine can still forge a listed login, and that includes a subagent shell with network, even a wrapped codex shell that can't read `~/.swarmbase`. It's one more reason `write` is for trusted callers only.

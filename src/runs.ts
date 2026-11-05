@@ -39,6 +39,11 @@ const MAX_LOG_EVENTS = 2000;
 const MAX_PHASES = 100;
 const WATCHDOG_INTERVAL_MS = 30_000;
 const WATCHDOG_DEAD_MS = 120_000;
+/** The longest delay setTimeout takes; anything longer fires at once. */
+const TIMER_MAX_MS = 2_147_483_647;
+/** An agent's default USD cap is budget/8, up to this. Above it a large budget would
+ *  only make each reservation bigger, keeping a run to 8 agents at once for no reason. */
+const AGENT_DEFAULT_USD_CEILING = 10_000;
 const FINISH_SETTLE_MS = 8_000;
 
 export interface RunEndListener {
@@ -65,7 +70,7 @@ interface ActiveRun {
   budgetWaiters: Set<() => void>;
   logCount: number;
   ending: boolean;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
   watchdog: NodeJS.Timeout;
   lastPong: number;
   stderrTail: string;
@@ -92,7 +97,7 @@ interface ResolvedAgent {
   profile: Profile;
   engine: EngineName;
   cwd: string;
-  timeoutMs: number;
+  timeoutMs: number | null;
   maxUsd: number | null;
   maxTokens: number;
   warnings: string[];
@@ -149,6 +154,8 @@ export class RunManager {
       resumedFrom: input.resumeFrom,
       keepWork: input.keepWork,
     });
+    meta.deadlineAt = new Date(Date.now() + this.cfg.runTimeoutMs).toISOString();
+    this.store.saveMeta(meta);
     this.store.emit(meta.id, { type: 'run_start', caller: meta.caller, label: meta.label, budgetUsd: meta.budgetUsd, budgetTokens: meta.budgetTokens, resumedFrom: meta.resumedFrom });
 
     const child = fork(RUNNER_PATH, [], {
@@ -171,7 +178,6 @@ export class RunManager {
       budgetWaiters: new Set(),
       logCount: 0,
       ending: false,
-      timer: setTimeout(() => this.finish(run, 'failed', null, `run exceeded ${Math.round(this.cfg.runTimeoutMs / 60000)} min`), this.cfg.runTimeoutMs),
       watchdog: setInterval(() => {
         // A busy loop after the first await blocks the runner's event loop, so it
         // stops answering pings; the vm timeout only covers the synchronous start.
@@ -185,6 +191,7 @@ export class RunManager {
       stderrTail: '',
     };
     this.active.set(meta.id, run);
+    this.armDeadline(run);
 
     child.stderr?.on('data', (c: Buffer) => { run.stderrTail = (run.stderrTail + c.toString('utf8')).slice(-4000); });
     child.stdout?.on('data', () => { /* runner never writes stdout; drain anyway */ });
@@ -207,6 +214,27 @@ export class RunManager {
     if (!run || run.ending) return false;
     this.finish(run, 'cancelled', null, `cancelled by ${by}`);
     return true;
+  }
+
+  /** Fail the run at its deadline. A deadline further off than one timer can wait takes several hops. */
+  private armDeadline(run: ActiveRun): void {
+    clearTimeout(run.timer);
+    const left = Date.parse(run.meta.deadlineAt!) - Date.now();
+    if (left <= 0) {
+      this.finish(run, 'failed', null, `run reached its deadline (${run.meta.deadlineAt})`);
+      return;
+    }
+    run.timer = setTimeout(() => this.armDeadline(run), Math.min(left, TIMER_MAX_MS));
+  }
+
+  /** Push a running run's deadline back. Returns the new deadline, or null if the run isn't running. */
+  extendDeadline(runId: string, ms: number): string | null {
+    const run = this.active.get(runId);
+    if (!run || run.ending) return null;
+    run.meta.deadlineAt = new Date(Date.parse(run.meta.deadlineAt!) + ms).toISOString();
+    this.store.saveMeta(run.meta);
+    this.store.emit(runId, { type: 'log', message: `[swarmbase] deadline extended to ${run.meta.deadlineAt}` });
+    return run.meta.deadlineAt; // the armed timer re-reads it when it fires
   }
 
   skipAgent(runId: string, n: number): boolean {
@@ -440,7 +468,11 @@ export class RunManager {
       maxTokens = Math.min(v, cap);
     }
 
-    const timeoutMs = Math.min(this.cfg.agentTimeoutMs, Math.max(10_000, Number(opts.timeoutMs ?? this.cfg.agentTimeoutMs) || this.cfg.agentTimeoutMs));
+    const timeoutCap = Math.min(this.cfg.agentTimeoutMs ?? TIMER_MAX_MS, TIMER_MAX_MS);
+    const asked = Number(opts.timeoutMs);
+    const timeoutMs = opts.timeoutMs !== undefined && asked > 0
+      ? Math.min(timeoutCap, Math.max(10_000, asked))
+      : this.cfg.agentTimeoutMs === null ? null : timeoutCap;
     const label = typeof opts.label === 'string' && opts.label.trim() ? opts.label.trim().slice(0, 80) : `agent-${n}`;
     const phase = typeof opts.phase === 'string' ? opts.phase.slice(0, 120) : run.meta.currentPhase;
     return { label, phase, schema, model, effort, profile, engine, cwd, timeoutMs, maxUsd, maxTokens, warnings };
@@ -539,7 +571,7 @@ export class RunManager {
       return;
     }
 
-    const want: Reservation = { usd: a.maxUsd ?? Math.max(0.5, meta.budgetUsd / 8), tokens: a.engine === 'codex' ? a.maxTokens : 0 };
+    const want: Reservation = { usd: a.maxUsd ?? Math.min(AGENT_DEFAULT_USD_CEILING, Math.max(0.5, meta.budgetUsd / 8)), tokens: a.engine === 'codex' ? a.maxTokens : 0 };
     if (this.exhausted(run, want) && run.reservedUsd <= 0 && run.reservedTokens <= 0) {
       replyErr(this.exhaustedMessage(run, want));
       return;

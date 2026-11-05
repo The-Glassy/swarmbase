@@ -50,6 +50,8 @@ export interface RunMeta {
   resultChars: number | null;
   /** Keep `work/` after the run ends (default: deleted, see Config.deleteWorkOnEnd). */
   keepWork?: boolean;
+  /** When the run fails if it's still going; `extend` moves it. Absent on runs recorded before it existed. */
+  deadlineAt?: string;
 }
 
 export type RunEvent = { seq: number; ts: string } & (

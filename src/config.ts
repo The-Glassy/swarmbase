@@ -88,7 +88,9 @@ export interface Config {
   maxConcurrentAgents: number;
   perRunConcurrency: number;
   maxAgentsPerRun: number;
-  agentTimeoutMs: number;
+  /** Wall clock for one agent, and the most a script may ask for. null = none; the run's deadline still ends it. */
+  agentTimeoutMs: number | null;
+  /** How long a run has before it fails, unless its caller pushes the deadline back with `extend`. */
   runTimeoutMs: number;
   /** Chars of the return value inlined into the completion push. */
   previewChars: number;
@@ -118,8 +120,8 @@ const DEFAULTS: Omit<Config, 'callers'> = {
   maxConcurrentAgents: 10,
   perRunConcurrency: 8,
   maxAgentsPerRun: 200,
-  agentTimeoutMs: 30 * 60_000,
-  runTimeoutMs: 6 * 60 * 60_000,
+  agentTimeoutMs: null,
+  runTimeoutMs: 24 * 60 * 60_000,
   previewChars: 4000,
   engines: {
     claude: { bin: 'claude', baseUrl: null },
@@ -226,6 +228,8 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   cfg.claudeBin = claude.bin;
   cfg.dataDir = expand(cfg.dataDir);
   if (typeof cfg.deleteWorkOnEnd !== 'boolean') throw new Error('config: deleteWorkOnEnd must be true or false');
+  if (cfg.agentTimeoutMs !== null && !(Number(cfg.agentTimeoutMs) > 0)) throw new Error('config: agentTimeoutMs must be a positive number, or null for none');
+  if (!(Number(cfg.runTimeoutMs) > 0)) throw new Error('config: runTimeoutMs must be a positive number');
   const names = new Set<string>();
   for (const c of cfg.callers) {
     if (names.has(c.name)) throw new Error(`config: duplicate caller "${c.name}"`);

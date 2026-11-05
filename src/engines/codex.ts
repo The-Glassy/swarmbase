@@ -65,7 +65,7 @@ export interface CodexAgentSpec {
   effort: string | null;
   profile: Profile;
   cwd: string;
-  timeoutMs: number;
+  timeoutMs: number | null;
   maxBudgetUsd: number | null;
   maxTokens: number;
   streamPath: string;
@@ -427,7 +427,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   };
   const onAbort = () => stop('cancelled', '');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => stop('timeout', ''), spec.timeoutMs);
+  const timer = spec.timeoutMs === null ? undefined : setTimeout(() => stop('timeout', ''), spec.timeoutMs);
 
   child.stdin.on('error', () => { /* child died before reading the prompt */ });
   child.stdin.end(spec.prompt);
