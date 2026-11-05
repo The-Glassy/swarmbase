@@ -121,7 +121,8 @@ test('a read failing after the headers went out ends that response, not the daem
   const real = store.readEvents;
   store.readEvents = () => { throw new Error('simulated EMFILE'); };
   try {
-    await assert.rejects(call(`/api/runs/${meta.id}/events`, as(VIEWER)));
+    // Ended by the server, not by the helper giving up on a response left hanging.
+    await assert.rejects(call(`/api/runs/${meta.id}/events`, as(VIEWER)), (e: Error) => !e.message.includes('no complete response'));
   } finally {
     store.readEvents = real;
   }

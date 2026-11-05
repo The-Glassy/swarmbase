@@ -212,7 +212,8 @@ Being on the tailnet is not enough to view. The dashboard shows subagent prompts
 every page, API route and event stream requires a `Tailscale-User-Login` listed in `dashboard.viewerLogins` or
 `dashboard.adminLogins`. Everyone else gets a 403, including tagged nodes and Funnel traffic, which carry no user
 identity. Only `/api/health` (run counts) and `/api/whoami` answer anyone. Both lists are re-read when the config file
-changes, so adding or removing a viewer needs no restart.
+changes, so adding or removing a viewer needs no restart. A file that fails to parse keeps the last good lists, so
+after removing someone, check the log for `dashboard access reloaded`.
 
 Cancel and skip require an admin login plus an `X-SwarmBase: 1` header, which blocks cross-site POSTs. A Host
 allowlist blocks DNS rebinding.
