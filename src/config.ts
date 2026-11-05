@@ -228,8 +228,9 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   cfg.claudeBin = claude.bin;
   cfg.dataDir = expand(cfg.dataDir);
   if (typeof cfg.deleteWorkOnEnd !== 'boolean') throw new Error('config: deleteWorkOnEnd must be true or false');
-  if (cfg.agentTimeoutMs !== null && !(Number(cfg.agentTimeoutMs) > 0)) throw new Error('config: agentTimeoutMs must be a positive number, or null for none');
-  if (!(Number(cfg.runTimeoutMs) > 0)) throw new Error('config: runTimeoutMs must be a positive number');
+  const usableMs = (v: unknown): boolean => typeof v === 'number' && v > 0 && Number.isFinite(new Date(Date.now() + v).getTime());
+  if (cfg.agentTimeoutMs !== null && !usableMs(cfg.agentTimeoutMs)) throw new Error('config: agentTimeoutMs must be a positive number of milliseconds, or null for none');
+  if (!usableMs(cfg.runTimeoutMs)) throw new Error('config: runTimeoutMs must be a positive number of milliseconds');
   const names = new Set<string>();
   for (const c of cfg.callers) {
     if (names.has(c.name)) throw new Error(`config: duplicate caller "${c.name}"`);

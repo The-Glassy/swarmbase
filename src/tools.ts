@@ -244,7 +244,7 @@ export class SwarmTools implements ToolHost {
     const hours = Number(args.hours);
     if (!(hours > 0 && hours <= MAX_EXTEND_HOURS)) return text(`hours must be a positive number, at most ${MAX_EXTEND_HOURS}.`, true);
     const deadline = this.runs.extendDeadline(meta.id, hours * 3_600_000);
-    if (!deadline) return text(`Run ${meta.id} is not running (${meta.status}).`);
+    if (!deadline) return text(`Run ${meta.id} has ended or is ending, so its deadline was not changed.`, true);
     return text(`Run ${meta.id} now has until ${deadline}.`);
   }
 

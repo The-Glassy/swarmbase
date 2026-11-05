@@ -4,7 +4,7 @@
  * levels, and the end-of-run bookkeeping that hands off to the Notifier.
  *
  * Budget model: every started agent RESERVES its cap (opts.maxUsd, default
- * max($0.50, budget/8)) and runs with `--max-budget-usd=<cap>`; spend is
+ * max($0.50, budget/8), at most $10,000) and runs with `--max-budget-usd=<cap>`; spend is
  * settled when it ends and the unused part of the reservation returns. An agent
  * that can't get even a minimum reservation waits while others hold
  * reservations, and agent() throws once nothing is left. Overshoot is bounded

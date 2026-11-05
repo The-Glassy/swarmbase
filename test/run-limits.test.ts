@@ -68,11 +68,15 @@ test('the defaults: no per-agent timeout, 24 hours for a run', () => {
   assert.equal(cfg.runTimeoutMs, 24 * 3_600_000);
   assert.throws(() => parseConfig({ agentTimeoutMs: 0 }), /agentTimeoutMs/);
   assert.throws(() => parseConfig({ runTimeoutMs: 0 }), /runTimeoutMs/);
+  // Each of these would otherwise throw when a run starts, after its record is written.
+  for (const bad of ['86400000', Infinity, 1e30]) {
+    assert.throws(() => parseConfig({ runTimeoutMs: bad as number }), /runTimeoutMs/, String(bad));
+  }
 });
 
 test('a large budget does not hold a run to 8 agents at once', async () => {
   const { store, start } = harness({ perRunConcurrency: 20, maxConcurrentAgents: 20 });
-  const { meta, done } = start(fanOut(12, 1), 10_000_000);
+  const { meta, done } = start(fanOut(12, 2), 10_000_000);
   await done;
   assert.equal(store.get(meta.id)?.status, 'completed');
   assert.equal(store.readResultText(meta.id), '12');
@@ -89,7 +93,7 @@ test('a default cap stops at the ceiling instead of growing with the budget', as
 test('a budget a caller names still keeps budget/8, so its agents are not starved', async () => {
   const { store, start } = harness({ perRunConcurrency: 1000, maxConcurrentAgents: 1000 });
   writeFileSync(argsLog, '');
-  const { meta, done } = start(fanOut(10, 1), 1000);
+  const { meta, done } = start(fanOut(10, 2), 1000);
   await done;
   assert.match(readFileSync(argsLog, 'utf8'), /--max-budget-usd=125\.00/);
   assert.equal(peakConcurrency(store, meta.id), 8);
@@ -102,15 +106,19 @@ test('a configured agent timeout still stops an agent', async () => {
   await done;
   assert.equal(store.get(meta.id)?.status, 'completed');
   assert.equal(store.readResultText(meta.id), '0');
+  // Held until the timeout, rather than a CLI that failed to start.
+  const end = store.readEvents(meta.id).find((e) => e.type === 'agent_end') as { durationMs: number };
+  assert.ok(end.durationMs >= 250 && end.durationMs < 10_000, `ran ${end.durationMs} ms`);
 });
 
 test('a run fails at its deadline, and says so', async () => {
-  const { store, start } = harness({ runTimeoutMs: 400 });
+  const { store, start } = harness({ runTimeoutMs: 1500 });
   const { meta, done } = start(fanOut(1, 30));
   await done;
   const ended = store.get(meta.id)!;
   assert.equal(ended.status, 'failed');
   assert.match(ended.error ?? '', /reached its deadline/);
+  assert.ok(store.readEvents(meta.id).some((e) => e.type === 'agent_start'), 'an agent was running when the deadline came');
 });
 
 test('extending keeps a run past its deadline, including past what one timer can wait', async () => {
@@ -138,15 +146,19 @@ test('the extend tool: only your own running run, by a sane amount, and status s
   assert.match(moved.content[0].text, /now has until/);
   assert.match((await tools.callTool(caller, 'status', { runId: meta.id })).content[0].text, new RegExp(`Deadline: ${store.get(meta.id)!.deadlineAt}`));
 
+  const agreed = store.get(meta.id)!.deadlineAt;
   for (const hours of [0, -1, 'soon', Infinity, 2_000_000]) {
     assert.ok((await tools.callTool(caller, 'extend', { runId: meta.id, hours })).isError, String(hours));
   }
   const stranger = { ...caller, name: 'someone-else' };
   assert.ok((await tools.callTool(stranger, 'extend', { runId: meta.id, hours: 1 })).isError);
+  assert.equal(store.get(meta.id)!.deadlineAt, agreed, 'a refused request changes nothing');
 
   await done;
   const late = await tools.callTool(caller, 'extend', { runId: meta.id, hours: 1 });
-  assert.match(late.content[0].text, /is not running/);
+  assert.ok(late.isError);
+  assert.match(late.content[0].text, /has ended or is ending/);
+  assert.equal(store.get(meta.id)!.deadlineAt, agreed);
 });
 
 test('subagents can not fetch tailnet hosts', () => {

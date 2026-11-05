@@ -62,7 +62,7 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   seeds in via \`args\`; vary prompts by index for diversity. No timers, filesystem or network in the script itself —
   subagents do the work.
 - Up to ${opts.perRun} agents of a run execute at once (more queue); at most ${opts.maxAgents} agents per run.
-- A run has ${Math.round(opts.runTimeoutMs / 3_600_000)} hours. At its deadline its agents stop and the run fails, with finished results cached for
+- A run has ${Math.round(opts.runTimeoutMs / 36_000) / 100} hours. At its deadline its agents stop and the run fails, with finished results cached for
   \`resume\`. The \`extend\` tool pushes the deadline back, and \`status\` shows it.
 - Every subagent is billed to your SwarmBase budget. Each one costs a boot of a few
   cents plus its work; prefer fewer, well-briefed agents over many tiny ones, and profile "think" when no tools
