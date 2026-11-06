@@ -1,5 +1,5 @@
 /** The authoring reference handed to callers by the `guide` tool. */
-export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; tokensDefault: number; tokensMax: number; maxAgents: number; perRun: number; cwdRoots: string[] }): string {
+export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; tokensDefault: number; tokensMax: number; maxAgents: number; perRun: number; agentTimeoutMs: number | null; runTimeoutMs: number; cwdRoots: string[] }): string {
   const codex = opts.engines.includes('codex');
   return `# SwarmBase — writing a run
 
@@ -41,8 +41,8 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir, which is
     deleted when the run ends (start the run with \`keepWork: true\` to keep it; \`resume\` gets a fresh one).
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.
-  - \`timeoutMs\` — per-agent wall clock (default and cap 30 min).
-  - \`maxUsd\` — this agent's spending cap (default max($0.50, budget/8)). The cap is reserved from the run budget
+  - \`timeoutMs\` — per-agent wall clock (${opts.agentTimeoutMs === null ? 'default none; the run\'s deadline still ends the agent' : `default and cap ${Math.round(opts.agentTimeoutMs / 60000)} min`}).
+  - \`maxUsd\` — this agent's spending cap (default max($0.50, budget/8), at most $10,000). The cap is reserved from the run budget
     while the agent runs, so concurrency is limited by how many caps fit: give cheap agents a small maxUsd to run
     more at once, and heavy ones a bigger one. An agent that hits its cap ends as null.
   - \`fresh: true\` — never answer this call from the resume cache.
@@ -62,6 +62,8 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   seeds in via \`args\`; vary prompts by index for diversity. No timers, filesystem or network in the script itself —
   subagents do the work.
 - Up to ${opts.perRun} agents of a run execute at once (more queue); at most ${opts.maxAgents} agents per run.
+- A run has ${Math.round(opts.runTimeoutMs / 36_000) / 100} hours. At its deadline its agents stop and the run fails, with finished results cached for
+  \`resume\`. The \`extend\` tool pushes the deadline back, and \`status\` shows it.
 - Every subagent is billed to your SwarmBase budget. Each one costs a boot of a few
   cents plus its work; prefer fewer, well-briefed agents over many tiny ones, and profile "think" when no tools
   are needed.

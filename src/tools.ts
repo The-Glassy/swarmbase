@@ -7,6 +7,9 @@ import type { RunManager } from './runs.js';
 import type { ToolHost, ToolResult } from './session.js';
 import type { RunEvent, RunMeta, RunStatus, RunStore } from './store.js';
 
+/** Keeps a deadline inside what a Date can hold, however often a run is extended in practice. */
+const MAX_EXTEND_HOURS = 1_000_000;
+
 const MAX_SCRIPT_CHARS = 200_000;
 const MAX_ARGS_CHARS = 2_000_000;
 
@@ -68,6 +71,18 @@ export class SwarmTools implements ToolHost {
         inputSchema: { type: 'object', properties: { runId: { type: 'string' } }, required: ['runId'] },
       },
       {
+        name: 'extend',
+        description: 'Push a running run\'s deadline back. A run that reaches its deadline fails, with finished results cached for resume. `status` shows the deadline.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            runId: { type: 'string' },
+            hours: { type: 'number', description: 'Hours to add to the current deadline.' },
+          },
+          required: ['runId', 'hours'],
+        },
+      },
+      {
         name: 'list',
         description: 'Your recent runs.',
         inputSchema: {
@@ -108,6 +123,7 @@ export class SwarmTools implements ToolHost {
         case 'status': return this.status(caller, args);
         case 'result': return this.result(caller, args);
         case 'cancel': return this.cancel(caller, args);
+        case 'extend': return this.extend(caller, args);
         case 'list': return this.list(caller, args);
         case 'guide': return text(guideText({
           defaultModel: caller.defaultModel,
@@ -120,6 +136,8 @@ export class SwarmTools implements ToolHost {
           tokensMax: caller.runTokensMax,
           maxAgents: this.cfg.maxAgentsPerRun,
           perRun: this.cfg.perRunConcurrency,
+          agentTimeoutMs: this.cfg.agentTimeoutMs,
+          runTimeoutMs: this.cfg.runTimeoutMs,
           cwdRoots: caller.cwdRoots,
         }));
         default: return text(`Unknown tool: ${name}`, true);
@@ -221,6 +239,15 @@ export class SwarmTools implements ToolHost {
     return text(`Cancelled run ${meta.id}. ${meta.counts.ok} finished agent result(s) stay cached for resume.`);
   }
 
+  private extend(caller: CallerPolicy, args: Record<string, unknown>): ToolResult {
+    const meta = this.own(caller, args);
+    const hours = Number(args.hours);
+    if (!(hours > 0 && hours <= MAX_EXTEND_HOURS)) return text(`hours must be a positive number, at most ${MAX_EXTEND_HOURS}.`, true);
+    const deadline = this.runs.extendDeadline(meta.id, hours * 3_600_000);
+    if (!deadline) return text(`Run ${meta.id} has ended or is ending, so its deadline was not changed. \`resume\` starts a new run from its finished results.`, true);
+    return text(`Run ${meta.id} now has until ${deadline}.`);
+  }
+
   private list(caller: CallerPolicy, args: Record<string, unknown>): ToolResult {
     const limit = Math.min(50, Math.max(1, Math.floor(Number(args.limit ?? 10)) || 10));
     const status = typeof args.status === 'string' ? (args.status as RunStatus) : undefined;
@@ -254,6 +281,7 @@ export function statusText(meta: RunMeta, events: RunEvent[], url: string | null
   const lines = [
     `Run ${meta.id}${meta.label ? ` "${meta.label}"` : ''} — ${meta.status}${meta.currentPhase ? ` · phase "${meta.currentPhase}"` : ''} · ${countsLine(meta)} · $${meta.spentUsd.toFixed(2)} of $${meta.budgetUsd.toFixed(2)}${meta.spentTokens ? ` · ${meta.spentTokens.toLocaleString('en-US')} of ${meta.budgetTokens.toLocaleString('en-US')} codex tokens` : ''} · ${took}`,
   ];
+  if (meta.status === 'running' && meta.deadlineAt) lines.push(`Deadline: ${meta.deadlineAt}`);
   if (meta.error) lines.push(`Error: ${meta.error}`);
   if (meta.phases.length) lines.push(`Phases: ${meta.phases.join(' → ')}`);
   const rows = agentRows(events);

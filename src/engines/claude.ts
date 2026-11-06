@@ -42,7 +42,7 @@ export interface ClaudeAgentSpec {
   effort: string | null;
   profile: Profile;
   cwd: string;
-  timeoutMs: number;
+  timeoutMs: number | null;
   maxBudgetUsd: number | null;
   streamPath: string;
   apiKey: string;
@@ -95,6 +95,9 @@ export function denyRules(dataDir: string): string[] {
     `Read(/${h}/.ssh/**)`, `Read(/${h}/.claude/**)`, `Read(/${h}/.claude.json)`,
     `Read(/${h}/.codex/**)`, `Read(/${h}/.portal/**)`, `Read(/${h}/.aws/**)`, `Read(/${h}/.config/**)`,
     'Read(**/.env)', 'Read(**/.env.*)', 'Read(**/*.token)', 'Read(**/*credentials*)',
+    // On an untagged machine, a request to its own tailnet name carries its owner's login, so a
+    // fetch would reach the dashboard (every caller's runs) and other tailnet services as them.
+    'WebFetch(domain:*.ts.net)',
   ];
 }
 
@@ -281,7 +284,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   };
   const onAbort = () => stop('cancelled');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => stop('timeout'), spec.timeoutMs);
+  const timer = spec.timeoutMs === null ? undefined : setTimeout(() => stop('timeout'), spec.timeoutMs);
 
   child.stdin.on('error', () => { /* child died before reading the prompt */ });
   child.stdin.end(spec.prompt);
