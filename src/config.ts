@@ -46,8 +46,13 @@ export interface CallerPolicy {
   name: string;
   /** sha256 hex of the caller's MCPL WebSocket token. */
   tokenSha256: string;
-  /** File holding the API key (or inference-gateway token) this caller's agents run on. */
-  apiKeyFile: string;
+  /** File holding the API key (or inference-gateway token) this caller's agents run on.
+   *  The codex engine needs it (its gateway token). */
+  apiKeyFile: string | null;
+  /** File holding a Claude subscription token (`claude setup-token`), for the claude
+   *  engine. Passed as CLAUDE_CODE_OAUTH_TOKEN and, when set, used instead of apiKeyFile,
+   *  so a request never carries both schemes (connectome-host's ANTHROPIC_AUTH_TOKEN). */
+  authTokenFile: string | null;
   /** Optional Linux identity. Omit to retain the original daemon-user behavior. */
   runAs?: string;
   /** Per-caller workspace root; defaults to the Linux account's home. */
@@ -253,7 +258,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
 function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   if (!c.name || !/^[a-z0-9][a-z0-9_-]{0,40}$/.test(c.name)) throw new Error(`config: bad caller name ${JSON.stringify(c.name)}`);
   if (!c.tokenSha256 || !/^[0-9a-f]{64}$/.test(c.tokenSha256)) throw new Error(`config: caller ${c.name} needs tokenSha256 (64 hex)`);
-  if (!c.apiKeyFile) throw new Error(`config: caller ${c.name} needs apiKeyFile`);
+  if (!c.apiKeyFile && !c.authTokenFile) throw new Error(`config: caller ${c.name} needs apiKeyFile or authTokenFile`);
   if (c.runAs !== undefined && (typeof c.runAs !== 'string' || !/^[a-z_][a-z0-9_-]{0,31}$/.test(c.runAs) || c.runAs === 'root')) {
     throw new Error(`config: caller ${c.name} runAs must be a non-root Linux username`);
   }
@@ -265,6 +270,9 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   const engines = c.engines ?? ['claude'];
   for (const e of engines) if (!ENGINES.includes(e)) throw new Error(`config: caller ${c.name} unknown engine ${JSON.stringify(e)} (${ENGINES.join(' | ')})`);
   if (!engines.length) throw new Error(`config: caller ${c.name} lists no engines`);
+  if (engines.includes('codex') && !c.apiKeyFile) {
+    throw new Error(`config: caller ${c.name} lists the codex engine, which needs apiKeyFile (its gateway token); authTokenFile is for claude only`);
+  }
   const defaultModels: Record<EngineName, string> = {
     ...DEFAULT_MODELS,
     ...(c.defaultModel ? { claude: c.defaultModel } : {}),
@@ -273,7 +281,8 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   return {
     name: c.name,
     tokenSha256: c.tokenSha256,
-    apiKeyFile: expand(c.apiKeyFile),
+    apiKeyFile: c.apiKeyFile ? expand(c.apiKeyFile) : null,
+    authTokenFile: c.authTokenFile ? expand(c.authTokenFile) : null,
     ...(c.runAs ? { runAs: c.runAs, ...(c.homeDir ? { homeDir: resolve(c.homeDir) } : {}) } : {}),
     engines,
     maxProfile,

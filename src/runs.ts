@@ -632,21 +632,28 @@ export class RunManager {
       const common = {
         runId: meta.id, n, label: a.label, prompt, schema: a.schema, model: a.model, effort: a.effort, profile: a.profile,
         cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved.usd, streamPath: this.store.agentStreamPath(meta, n),
-        apiKey: readApiKey(run.caller.apiKeyFile), dataDir: realpathSync(this.cfg.dataDir),
+        dataDir: realpathSync(this.cfg.dataDir),
         callerUser: this.store.userContext(meta),
       };
+      // Every caller's API key and subscription token files: no agent may read its own
+      // caller's credentials or another's. Claude's rules are strings (configured and resolved
+      // paths); codex's sandbox mounts over what it denies, so it gets existing paths only.
+      const credFiles = this.cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile]).filter((f): f is string => !!f);
+      const credReal = credFiles.map(safeRealpath).filter((p): p is string => !!p);
+      const secretFiles = [...new Set([...credFiles, ...credReal])];
       if (a.engine === 'codex') {
         const codex = this.cfg.engines.codex;
         if (reserved.tokens < a.maxTokens) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: maxTokens ${a.maxTokens} cut to ${reserved.tokens}, what is left of the run's token budget` });
         const o = await runCodexAgent({
           ...common,
+          apiKey: readApiKey(run.caller.apiKeyFile!), // config requires it for codex callers
           maxTokens: reserved.tokens,
           homeDir: this.store.agentHomeDir(meta, n),
           baseUrl: codex.baseUrl!,
           codexBin: codex.bin,
           sandbox: codex.sandbox,
           extraRoBinds: codex.extraRoBinds,
-          denyExtra: [safeRealpath(run.caller.apiKeyFile), this.cfg.configPath].filter((p): p is string => !!p),
+          denyExtra: [...new Set(credReal), this.cfg.configPath].filter((p): p is string => !!p),
         }, this.meter!, slot.ac.signal, onActivity);
         if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 against the USD budget (set config.prices to shadow-price it); the run's token budget bounds it` });
         spentTokens = o.tokens;
@@ -654,9 +661,13 @@ export class RunManager {
       } else {
         outcome = await runClaudeAgent({
           ...common,
+          credential: run.caller.authTokenFile
+            ? { kind: 'authToken', value: readApiKey(run.caller.authTokenFile) }
+            : { kind: 'apiKey', value: readApiKey(run.caller.apiKeyFile!) },
           apiBaseUrl: this.cfg.engines.claude.baseUrl,
           claudeBin: this.cfg.engines.claude.bin,
           emptyMcpConfigPath: this.emptyMcpConfigPath,
+          secretFiles,
           homeDir: this.store.userContext(meta) ? this.store.agentHomeDir(meta, n) : undefined,
         }, slot.ac.signal, onActivity);
       }

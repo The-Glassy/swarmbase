@@ -41,7 +41,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
     let n = 0;
     const base = (): ClaudeAgentSpec => ({ runId: meta.id, n: ++n, label: 'probe', prompt: probe, schema: null, model: 'fake',
       effort: null, profile: 'write', cwd, timeoutMs: 10_000, maxBudgetUsd: null, streamPath: store.agentStreamPath(meta, n),
-      apiKey: 'test-key-a', apiBaseUrl: null, claudeBin: '/usr/local/libexec/swarmbase-test-agent',
+      credential: { kind: 'apiKey', value: 'test-key-a' }, secretFiles: [], apiBaseUrl: null, claudeBin: '/usr/local/libexec/swarmbase-test-agent',
       emptyMcpConfigPath: '/never-read-daemon-mcp', dataDir, callerUser: user, homeDir: store.agentHomeDir(meta, n) });
     const meter = new UsageMeter();
     await meter.start();
@@ -79,7 +79,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
 
       for (const sandbox of ['none', 'bwrap'] as const) for (const profile of ['write', 'read', 'think'] as const) await t.test(`codex ${profile}, ${sandbox}: CLI and outer wrapper run as A`, async () => {
         const s = base();
-        const outcome = await runCodexAgent({ ...s, homeDir: s.homeDir!, maxTokens: 1000,
+        const outcome = await runCodexAgent({ ...s, apiKey: 'test-key-a', homeDir: s.homeDir!, maxTokens: 1000,
           prompt: JSON.stringify({ action: 'probe', write: profile === 'write', otherKey: join(dataDir, 'b.key'), otherRoot: '/home/swarmbase-test-b/projects' }),
           profile, baseUrl: 'http://127.0.0.1:1', codexBin: '/usr/local/libexec/swarmbase-test-agent', sandbox, extraRoBinds: [], denyExtra: [] },
         meter, new AbortController().signal, () => {});

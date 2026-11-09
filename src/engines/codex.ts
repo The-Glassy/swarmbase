@@ -80,7 +80,7 @@ export interface CodexAgentSpec {
   extraRoBinds: string[];
   /** SwarmBase data dir (realpath), for the deny rules. */
   dataDir: string;
-  /** Files outside the data dir that hold this caller's secrets (its apiKeyFile,
+  /** Files outside the data dir that hold this caller's secrets (its apiKeyFile and authTokenFile,
    *  the daemon's config file): denied by path. */
   denyExtra: string[];
   callerUser?: CallerUser;

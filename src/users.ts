@@ -84,7 +84,10 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
   // Normalize before crossing that boundary so probes check the actual files.
   cfg.dataDir = resolve(cfg.dataDir);
   if (cfg.configPath) cfg.configPath = resolve(cfg.configPath);
-  for (const c of cfg.callers) c.apiKeyFile = resolve(c.apiKeyFile);
+  for (const c of cfg.callers) {
+    if (c.apiKeyFile) c.apiKeyFile = resolve(c.apiKeyFile);
+    if (c.authTokenFile) c.authTokenFile = resolve(c.authTokenFile);
+  }
   if (process.platform !== 'linux') throw new Error('runAs requires Linux');
   if (process.getuid?.() === 0) throw new Error('runAs: run the daemon as an unprivileged service user, never root');
   if (cfg.callers.some((c) => !c.runAs && c.maxProfile === 'write')) {
@@ -125,7 +128,7 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
         throw new Error(`runAs: daemon needs traversal of '${root}': usermod -aG ${c.runAs} <daemon>; chmod 2750 '${root}'; restart the daemon's login/service`);
       }
     }
-    accessSync(c.apiKeyFile, constants.R_OK);
+    for (const file of [c.apiKeyFile, c.authTokenFile].filter((p): p is string => !!p)) accessSync(file, constants.R_OK);
     users.set(c.name, user);
   }
   // Private daemon data includes records, outbox, and all keys/bearers under it.
@@ -133,7 +136,8 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
   if (daemon.uid !== process.getuid?.() || (daemon.mode & 0o077)) throw new Error(`runAs: chown <daemon> '${cfg.dataDir}' && chmod 0700 '${cfg.dataDir}'`);
   for (const [name, user] of users) {
     const paths = [cfg.dataDir, ...(cfg.configPath ? [cfg.configPath] : []),
-      ...cfg.callers.filter((c) => c.name !== name).flatMap((c) => [c.apiKeyFile, ...(c.homeDir ? [c.homeDir] : []), ...c.cwdRoots])];
+      ...cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile]).filter((p): p is string => !!p),
+      ...cfg.callers.filter((c) => c.name !== name).flatMap((c) => [...(c.homeDir ? [c.homeDir] : []), ...c.cwdRoots])];
     const checks = operation(user, { op: 'check', paths });
     assertNoCallerAccess(user, checks.paths);
     // A 0600 file/0700 directory is insufficient if a caller can replace an

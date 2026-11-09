@@ -46,12 +46,14 @@ export interface ClaudeAgentSpec {
   timeoutMs: number | null;
   maxBudgetUsd: number | null;
   streamPath: string;
-  apiKey: string;
+  credential: ClaudeCredential;
   apiBaseUrl: string | null;
   claudeBin: string;
   emptyMcpConfigPath: string;
   /** SwarmBase data dir (realpath), for the deny rules. */
   dataDir: string;
+  /** Credential files of every caller (absolute), denied by path. */
+  secretFiles: string[];
   callerUser?: CallerUser;
   homeDir?: string;
 }
@@ -89,10 +91,12 @@ export function allowRules(profile: Profile, cwd: string): string[] {
  *  Inside the SwarmBase data dir only the secrets and run metadata are denied: a
  *  blanket deny on the data dir would also cover runs/<id>/work, the default cwd,
  *  and deny beats allow (verified: the agent could not read its own work dir). */
-export function denyRules(dataDir: string): string[] {
+export function denyRules(dataDir: string, secretFiles: string[] = []): string[] {
   const h = homedir();
   const d = dataDir.replace(/\/+$/, '');
   return [
+    // every caller's credential files by path, wherever the config puts them
+    ...secretFiles.map((f) => `Read(/${f})`),
     `Read(/${d}/*.token)`, `Read(/${d}/*.key)`, `Read(/${d}/config.json*)`, `Read(/${d}/outbox.json)`, `Read(/${d}/live-agents.json)`,
     ...['meta.json', 'events.jsonl', 'journal.jsonl', 'script.js', 'args.json', 'result.json', 'agents/**'].map((f) => `Read(/${d}/runs/*/${f})`),
     `Read(/${h}/.ssh/**)`, `Read(/${h}/.claude/**)`, `Read(/${h}/.claude.json)`,
@@ -204,6 +208,16 @@ export function ensureEmptyMcpConfig(dataDir: string): string {
   return p;
 }
 
+/** What a claude agent authenticates with: an API key (or gateway token), or a Claude
+ *  subscription token from `claude setup-token`. */
+export type ClaudeCredential = { kind: 'apiKey' | 'authToken'; value: string };
+
+/** The CLI takes a subscription token only as CLAUDE_CODE_OAUTH_TOKEN; as
+ *  ANTHROPIC_API_KEY it would go out as an x-api-key and be refused. */
+export function credentialEnv(c: ClaudeCredential): Record<string, string> {
+  return c.kind === 'authToken' ? { CLAUDE_CODE_OAUTH_TOKEN: c.value } : { ANTHROPIC_API_KEY: c.value };
+}
+
 export function readApiKey(file: string): string {
   const t = readFileSync(file, 'utf8').trim();
   if (!t) throw new Error(`API key file ${file} is empty`);
@@ -232,7 +246,7 @@ export function buildArgs(spec: ClaudeAgentSpec): string[] {
     '--strict-mcp-config',
     `--mcp-config=${spec.emptyMcpConfigPath}`,
     '--setting-sources=',
-    `--settings=${JSON.stringify({ permissions: { deny: denyRules(spec.dataDir) } })}`,
+    `--settings=${JSON.stringify({ permissions: { deny: denyRules(spec.dataDir, spec.secretFiles) } })}`,
     '--permission-mode=dontAsk',
     `--tools=${tools.join(',')}`,
   ];
@@ -251,7 +265,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   for (const k of ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM']) {
     if (process.env[k] !== undefined) env[k] = process.env[k];
   }
-  env.ANTHROPIC_API_KEY = spec.apiKey;
+  Object.assign(env, credentialEnv(spec.credential));
   if (spec.apiBaseUrl) {
     env.ANTHROPIC_BASE_URL = spec.apiBaseUrl;
     // attribution for a gateway ledger; stripped by the gateway before upstream
