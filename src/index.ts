@@ -22,6 +22,7 @@ import { RunManager } from './runs.js';
 import { Session } from './session.js';
 import { RunStore } from './store.js';
 import { SwarmTools } from './tools.js';
+import { initializeCallerUsers } from './users.js';
 
 function log(line: string): void {
   console.error(`${new Date().toISOString()} [swarmbase] ${line}`);
@@ -31,9 +32,10 @@ async function main(): Promise<void> {
   const configPath = process.env.SWARMBASE_CONFIG ?? DEFAULT_CONFIG_PATH;
   const cfg = loadConfig(configPath);
   mkdirSync(cfg.dataDir, { recursive: true, mode: 0o700 });
+  const callerUsers = initializeCallerUsers(cfg);
   addPrices(cfg.prices);
   initLiveGroups(join(cfg.dataDir, 'live-agents.json'), log); // reap a crashed predecessor's agents
-  const store = new RunStore(cfg.dataDir);
+  const store = new RunStore(cfg.dataDir, callerUsers);
   const notifier = new Notifier(cfg, store);
   let meter: UsageMeter | null = null;
   if (cfg.engines.codex.baseUrl) {

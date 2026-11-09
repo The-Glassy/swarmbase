@@ -48,6 +48,10 @@ export interface CallerPolicy {
   tokenSha256: string;
   /** File holding the API key (or inference-gateway token) this caller's agents run on. */
   apiKeyFile: string;
+  /** Optional Linux identity. Omit to retain the original daemon-user behavior. */
+  runAs?: string;
+  /** Per-caller workspace root; defaults to the Linux account's home. */
+  homeDir?: string;
   engines: EngineName[];
   /** Highest tool profile this caller's subagents may run with. */
   maxProfile: Profile;
@@ -78,6 +82,8 @@ export interface DashboardAccess {
 }
 
 export interface Config {
+  /** Root-owned supervisor, executed by sudo as the caller (never as root). */
+  userHelper: string;
   host: string;
   port: number;
   dataDir: string;
@@ -112,6 +118,7 @@ export interface Config {
 export const DEFAULT_MODELS: Record<EngineName, string> = { claude: 'claude-sonnet-5-5', codex: 'gpt-6-astra' };
 
 const DEFAULTS: Omit<Config, 'callers'> = {
+  userHelper: '/usr/local/libexec/swarmbase-user',
   host: '127.0.0.1',
   port: 7360,
   dataDir: join(homedir(), '.swarmbase'),
@@ -227,6 +234,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   cfg.apiBaseUrl = claude.baseUrl;
   cfg.claudeBin = claude.bin;
   cfg.dataDir = expand(cfg.dataDir);
+  if (typeof cfg.userHelper !== 'string' || !isAbsolute(cfg.userHelper)) throw new Error('config: userHelper must be an absolute path');
   if (typeof cfg.deleteWorkOnEnd !== 'boolean') throw new Error('config: deleteWorkOnEnd must be true or false');
   const usableMs = (v: unknown): boolean => typeof v === 'number' && v > 0 && Number.isFinite(new Date(Date.now() + v).getTime());
   if (cfg.agentTimeoutMs !== null && !usableMs(cfg.agentTimeoutMs)) throw new Error('config: agentTimeoutMs must be a positive number of milliseconds, or null for none');
@@ -246,6 +254,12 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   if (!c.name || !/^[a-z0-9][a-z0-9_-]{0,40}$/.test(c.name)) throw new Error(`config: bad caller name ${JSON.stringify(c.name)}`);
   if (!c.tokenSha256 || !/^[0-9a-f]{64}$/.test(c.tokenSha256)) throw new Error(`config: caller ${c.name} needs tokenSha256 (64 hex)`);
   if (!c.apiKeyFile) throw new Error(`config: caller ${c.name} needs apiKeyFile`);
+  if (c.runAs !== undefined && (typeof c.runAs !== 'string' || !/^[a-z_][a-z0-9_-]{0,31}$/.test(c.runAs) || c.runAs === 'root')) {
+    throw new Error(`config: caller ${c.name} runAs must be a non-root Linux username`);
+  }
+  if (c.homeDir !== undefined && (!c.runAs || typeof c.homeDir !== 'string' || !isAbsolute(c.homeDir))) {
+    throw new Error(`config: caller ${c.name} homeDir requires runAs and an absolute path`);
+  }
   const maxProfile = c.maxProfile ?? 'read';
   if (!PROFILES.includes(maxProfile)) throw new Error(`config: caller ${c.name} bad maxProfile ${maxProfile}`);
   const engines = c.engines ?? ['claude'];
@@ -260,6 +274,7 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
     name: c.name,
     tokenSha256: c.tokenSha256,
     apiKeyFile: expand(c.apiKeyFile),
+    ...(c.runAs ? { runAs: c.runAs, ...(c.homeDir ? { homeDir: resolve(c.homeDir) } : {}) } : {}),
     engines,
     maxProfile,
     cwdRoots: (c.cwdRoots ?? []).map((r) => resolve(expand(r))),

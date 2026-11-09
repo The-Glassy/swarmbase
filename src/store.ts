@@ -17,6 +17,7 @@ import {
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Profile } from './config.js';
+import { agentHome, userOperation, type CallerUser } from './users.js';
 
 export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export type AgentStatus = 'queued' | 'running' | 'ok' | 'null' | 'skipped' | 'cached' | 'error';
@@ -50,6 +51,9 @@ export interface RunMeta {
   resultChars: number | null;
   /** Keep `work/` after the run ends (default: deleted, see Config.deleteWorkOnEnd). */
   keepWork?: boolean;
+  /** Caller-owned work lives outside the daemon's private records. */
+  callerRoot?: string;
+  callerUser?: string;
   /** When the run fails if it's still going; `extend` moves it. Absent on runs recorded before it existed. */
   deadlineAt?: string;
 }
@@ -88,7 +92,7 @@ export class RunStore {
   private listeners = new Map<string, Set<Listener>>();
   private globalListeners = new Set<(m: RunMeta) => void>();
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, private readonly users = new Map<string, CallerUser>()) {
     this.runsDir = join(dataDir, 'runs');
     mkdirSync(this.runsDir, { recursive: true });
     this.loadAll();
@@ -121,7 +125,9 @@ export class RunStore {
     const id = newRunId();
     const dir = join(this.runsDir, `${stamp()}-${id}`);
     mkdirSync(join(dir, 'agents'), { recursive: true });
-    mkdirSync(join(dir, 'work'), { recursive: true });
+    const user = this.users.get(input.caller);
+    if (user) userOperation(user, { op: 'mkdir', path: join(user.root, '.swarmbase', id, 'work') });
+    else mkdirSync(join(dir, 'work'), { recursive: true });
     writeFileSync(join(dir, 'script.js'), input.script);
     writeFileSync(join(dir, 'args.json'), JSON.stringify(input.args ?? null, null, 2));
     const meta: RunMeta = {
@@ -142,6 +148,7 @@ export class RunStore {
       phases: [],
       resumedFrom: input.resumedFrom,
       ...(input.keepWork ? { keepWork: true } : {}),
+      ...(user ? { callerRoot: user.root, callerUser: user.user } : {}),
       error: null,
       resultChars: null,
     };
@@ -273,12 +280,35 @@ export class RunStore {
 
   /** Throwaway home dir (CODEX_HOME) for an engine that keeps state on disk; the engine deletes it. */
   agentHomeDir(meta: RunMeta, n: number): string {
+    const user = this.userContext(meta);
+    if (user) return agentHome(user, meta.id, n);
     return join(meta.dir, 'agents', `${n}-home`);
+  }
+
+  userContext(meta: RunMeta): CallerUser | undefined {
+    if (!meta.callerRoot) return undefined;
+    const user = this.users.get(meta.caller);
+    // Don't silently revert an old isolated run to daemon-authority cleanup.
+    if (!user || user.root !== meta.callerRoot || user.user !== meta.callerUser) {
+      throw new Error(`run ${meta.id}: restore runAs ${meta.callerUser} and homeDir ${meta.callerRoot} to clean caller-owned work`);
+    }
+    return user;
   }
 
   /** Delete the throwaway homes a crashed daemon left behind (an engine deletes
    *  its own when the agent ends). Returns how many went. */
   sweepAgentHomes(meta: RunMeta): number {
+    const user = this.userContext(meta);
+    if (user) {
+      let n = 0;
+      // Agent count is recorded by the daemon; never enumerate caller paths and
+      // then delete them with daemon authority.
+      for (let i = 1; i <= meta.agentsTotal; i++) {
+        userOperation(user, { op: 'remove', path: this.agentHomeDir(meta, i) });
+        n++;
+      }
+      return n;
+    }
     let n = 0;
     const dir = join(meta.dir, 'agents');
     let names: string[] = [];
@@ -291,6 +321,8 @@ export class RunStore {
   }
 
   workDir(meta: RunMeta): string {
+    const user = this.userContext(meta);
+    if (user) return join(user.root, '.swarmbase', meta.id, 'work');
     return join(meta.dir, 'work');
   }
 
@@ -300,6 +332,8 @@ export class RunStore {
    *  a toolchain left read-only (Go's module cache is 0555) are made writable and retried.
    *  Returns false when nothing was there. */
   deleteWork(meta: RunMeta): boolean {
+    const user = this.userContext(meta);
+    if (user) return userOperation(user, { op: 'remove', path: this.workDir(meta), recreate: true });
     const dir = this.workDir(meta);
     let st;
     try { st = lstatSync(dir); } catch { return false; }

@@ -1,0 +1,193 @@
+#!/usr/bin/python3 -I
+"""Root-owned sudo entry point. ALWAYS runs as the target caller, never root.
+
+One JSON request on stdin, followed (for launch) by TERM/KILL control lines.
+No daemon environment or credentials in argv. No privileged filesystem work.
+"""
+import ctypes
+import json
+import os
+import pwd
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+def remove(path):
+    if os.path.islink(path) or not os.path.isdir(path):
+        if os.path.lexists(path):
+            os.unlink(path)
+        return
+
+    def writable(fn, p, exc):
+        if not os.path.islink(p):
+            os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) | 0o700)
+            fn(p)
+    shutil.rmtree(path, onerror=writable)
+
+
+def prepare(files):
+    if not files:
+        return
+    home = files['home']
+    # Never reuse state that an earlier agent could have planted.
+    os.makedirs(os.path.dirname(home), mode=0o750, exist_ok=True)
+    os.mkdir(home, 0o750)
+    os.mkdir(os.path.join(home, 'tmp'), 0o750)
+    for name, contents in files['files'].items():
+        if '/' in name or name in ('.', '..'):
+            raise ValueError('invalid home file name')
+        fd = os.open(os.path.join(home, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+        with os.fdopen(fd, 'w') as f:
+            f.write(contents)
+
+
+def children():
+    """All direct children, including double-forked descendants adopted by us."""
+    with open('/proc/self/task/%d/children' % os.getpid()) as f:
+        return [int(p) for p in f.read().split()]
+
+
+def reap_descendants():
+    # A subreaper adopts orphaned descendants. Repeatedly kill and reap direct
+    # children: as parents die their descendants become our children, even if
+    # they escaped the original process group with setsid().
+    while True:
+        pids = children()
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        while True:
+            try:
+                if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                    break
+            except ChildProcessError:
+                break
+        time.sleep(0.01)
+
+
+def launch(req, initial_control):
+    # Linux PR_SET_CHILD_SUBREAPER, before any child is forked.
+    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+    if ctypes.CDLL(None, use_errno=True).prctl(38, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'PR_SET_NO_NEW_PRIVS')
+    prepare(req.get('files'))
+    # Open first, then validate the actual directory and chdir by fd. An agent
+    # changing a symlink while a sibling starts cannot redirect this cwd.
+    cwd_fd = os.open(os.path.realpath(req['cwd']), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        cwd = os.readlink('/proc/self/fd/%d' % cwd_fd)
+        if os.fstat(cwd_fd).st_uid != os.getuid() or not any(
+                cwd == root or cwd.startswith(root.rstrip('/') + '/') for root in req['roots']):
+            raise ValueError('cwd must be owned by caller and inside its configured roots')
+        os.fchdir(cwd_fd)
+        env = {k: str(v) for k, v in req['env'].items() if v is not None}
+        account = pwd.getpwuid(os.getuid())
+        env.update(USER=account.pw_name, LOGNAME=account.pw_name, SHELL='/bin/sh')
+        pinned = '__SWARMBASE_PINNED_CWD__'
+        args = [str(cwd_fd) if a == pinned else a for a in req['args']]
+        # bwrap mounts the fd's directory, then chdirs inside its new mount
+        # namespace. --[ro-]bind-fd validates and closes the fd before the CLI;
+        # an ordinary --bind /proc/self/fd/N would leak host-directory access.
+        # The CLI uses -C . and never reopens the host cwd by name.
+        child = subprocess.Popen([req['command'], *args], env=env, pass_fds=(cwd_fd,) if pinned in req['args'] else (),
+                                 stdin=subprocess.PIPE, start_new_session=True)
+    finally:
+        os.close(cwd_fd)
+    # Feed large prompts without blocking the supervisor's control channel.
+    import threading
+    def feed():
+        try:
+            child.stdin.write(req['prompt'].encode())
+            child.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    threading.Thread(target=feed, daemon=True).start()
+    stopping = False
+    deadline = None
+
+    def stop(sig, frame=None):
+        nonlocal stopping, deadline
+        stopping = True
+        deadline = time.monotonic() + (0 if sig == signal.SIGKILL else 3)
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    sel = selectors.DefaultSelector()
+    sel.register(0, selectors.EVENT_READ)
+    if initial_control:
+        stop(signal.SIGKILL if b'KILL' in initial_control else signal.SIGTERM)
+    try:
+        while child.poll() is None and not (stopping and time.monotonic() >= deadline):
+            for key, mask in sel.select(0.05):
+                line = os.read(0, 4096)
+                stop(signal.SIGKILL if not line or b'KILL' in line else signal.SIGTERM)
+                if not line:
+                    sel.unregister(0)
+        code = child.poll()
+    finally:
+        reap_descendants()
+        child.wait()
+    return code if code is not None and code >= 0 else 1
+
+
+def main():
+    if os.getuid() == 0:
+        raise ValueError('helper must run as a non-root caller: sudo -u <caller>')
+    os.umask(0o027)
+    # Preserve control bytes coalesced into the same pipe read as the request.
+    line = bytearray()
+    while b'\n' not in line:
+        b = os.read(0, 65536)
+        if not b:
+            raise ValueError('missing request')
+        line.extend(b)
+    payload, _, initial_control = line.partition(b'\n')
+    req = json.loads(payload)
+    op = req['op']
+    if op == 'check':
+        paths = []
+        for p in req['paths']:
+            paths.append(dict(path=p, read=os.access(p, os.R_OK), write=os.access(p, os.W_OK),
+                              execute=os.access(p, os.X_OK), directory=os.path.isdir(p)))
+        bwrap_fd = False
+        if req.get('bwrap'):
+            try:
+                help_text = subprocess.check_output(['/usr/bin/bwrap', '--help'], env={'PATH': '/usr/bin:/bin'}, text=True, timeout=5)
+                bwrap_fd = '--bind-fd' in help_text and '--ro-bind-fd' in help_text
+            except (OSError, subprocess.SubprocessError):
+                pass
+        print(json.dumps(dict(uid=os.getuid(), gid=os.getgid(), home=pwd.getpwuid(os.getuid()).pw_dir, paths=paths, bwrapFd=bwrap_fd)))
+    elif op == 'mkdir':
+        os.makedirs(req['path'], mode=0o750, exist_ok=True)
+        print('true')
+    elif op == 'remove':
+        remove(req['path'])
+        if req.get('recreate'):
+            os.mkdir(req['path'], 0o750)
+        print('true')
+    elif op == 'launch':
+        return launch(req, initial_control)
+    else:
+        raise ValueError('unknown operation')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print('swarmbase-user: %s' % e, file=sys.stderr)
+        sys.exit(1)

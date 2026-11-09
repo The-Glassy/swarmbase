@@ -25,12 +25,13 @@
  *    StructuredOutput tool_use was emitted, so we harvest it from the stream.
  *  - A failed API call (e.g. unknown model) ends with subtype "success" + is_error.
  */
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { createWriteStream, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Profile } from '../config.js';
 import { looksLikeCodexAgent } from './codex.js';
+import { signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
 
 export interface ClaudeAgentSpec {
   runId: string;
@@ -51,6 +52,8 @@ export interface ClaudeAgentSpec {
   emptyMcpConfigPath: string;
   /** SwarmBase data dir (realpath), for the deny rules. */
   dataDir: string;
+  callerUser?: CallerUser;
+  homeDir?: string;
 }
 
 export interface AgentOutcome {
@@ -154,19 +157,25 @@ function persistLive(): void {
 
 /** Every engine records its agent's process group here, so shutdown and the
  *  boot-time reaper see codex agents as well as claude ones. */
-export function trackAgentGroup(pgid: number): void {
+const GROUP_STOPS = new Map<number, (sig: NodeJS.Signals) => void>();
+
+export function trackAgentGroup(pgid: number, stop?: (sig: NodeJS.Signals) => void): void {
   LIVE_GROUPS.add(pgid);
+  if (stop) GROUP_STOPS.set(pgid, stop);
   persistLive();
 }
 
 export function untrackAgentGroup(pgid: number): void {
   LIVE_GROUPS.delete(pgid);
+  GROUP_STOPS.delete(pgid);
   persistLive();
 }
 
 export function killAllAgentGroups(sig: NodeJS.Signals = 'SIGKILL'): number {
   let n = 0;
   for (const pgid of LIVE_GROUPS) {
+    const stop = GROUP_STOPS.get(pgid);
+    if (stop) { stop(sig); n++; continue; }
     try { process.kill(-pgid, sig); n++; } catch { /* gone */ }
   }
   return n;
@@ -255,15 +264,23 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   }
   env.DISABLE_AUTOUPDATER = '1';
 
-  const out = createWriteStream(spec.streamPath, { flags: 'a' });
-  const child = spawn(spec.claudeBin, buildArgs(spec), {
-    cwd: spec.cwd,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true, // own process group, so tools it spawned die with it
-  });
+  let files;
+  if (spec.callerUser) {
+    if (!spec.homeDir) throw new Error('isolated claude requires a throwaway home');
+    env.HOME = spec.homeDir;
+    env.TMPDIR = join(spec.homeDir, 'tmp');
+    env.USER = env.LOGNAME = spec.callerUser.user;
+    env.SHELL = '/bin/sh';
+    env.PATH = '/usr/local/bin:/usr/bin:/bin';
+    delete env.LC_ALL;
+    files = { home: spec.homeDir, files: { 'empty-mcp.json': '{"mcpServers":{}}' } };
+  }
 
-  if (child.pid !== undefined) trackAgentGroup(child.pid);
+  const out = createWriteStream(spec.streamPath, { flags: 'a' });
+  const args = buildArgs(spec.callerUser ? { ...spec, emptyMcpConfigPath: join(spec.homeDir!, 'empty-mcp.json') } : spec);
+  const child = spawnAgent(spec.claudeBin, args, spec.cwd, env, spec.prompt, spec.callerUser, files);
+
+  if (child.pid !== undefined) trackAgentGroup(child.pid, spec.callerUser ? (sig) => signalAgent(child, sig) : undefined);
   let resultEvent: Record<string, unknown> | null = null;
   let harvested: unknown = undefined;
   let lastText = '';
@@ -273,8 +290,7 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   let endReason: string | null = null;
 
   const killGroup = (sig: NodeJS.Signals) => {
-    if (child.pid === undefined) return;
-    try { process.kill(-child.pid, sig); } catch { /* already gone */ }
+    signalAgent(child, sig);
   };
   const stop = (why: string) => {
     if (endReason) return;
@@ -285,9 +301,6 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   const onAbort = () => stop('cancelled');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
   const timer = spec.timeoutMs === null ? undefined : setTimeout(() => stop('timeout'), spec.timeoutMs);
-
-  child.stdin.on('error', () => { /* child died before reading the prompt */ });
-  child.stdin.end(spec.prompt);
 
   let buf = '';
   child.stdout.on('data', (chunk: Buffer) => {
@@ -335,6 +348,9 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
       out.end();
+      if (spec.callerUser && spec.homeDir) {
+        try { userOperation(spec.callerUser, { op: 'remove', path: spec.homeDir }); } catch { /* sweep on restart */ }
+      }
       const durationMs = Date.now() - started;
       const r = resultEvent as Record<string, any> | null;
       // The CLI's own total when it got to report one; otherwise (killed,

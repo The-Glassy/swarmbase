@@ -47,13 +47,13 @@
  *  - `item.type: "error"` items are advisory ("model metadata not found"):
  *    a run fails on `turn.failed`, `error`, or a non-zero exit only.
  */
-import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { Profile } from '../config.js';
 import { estimateCost, KILL_GRACE_MS, priceFor, trackAgentGroup, untrackAgentGroup, type Activity, type AgentOutcome } from './claude.js';
 import type { Usage, UsageMeter } from '../meter.js';
+import { PINNED_CWD, signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
 
 export interface CodexAgentSpec {
   runId: string;
@@ -83,6 +83,7 @@ export interface CodexAgentSpec {
   /** Files outside the data dir that hold this caller's secrets (its apiKeyFile,
    *  the daemon's config file): denied by path. */
   denyExtra: string[];
+  callerUser?: CallerUser;
 }
 
 export interface CodexOutcome extends AgentOutcome {
@@ -271,7 +272,7 @@ export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bea
 export function buildArgs(spec: CodexAgentSpec, schemaPath: string | null): string[] {
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check', '--ignore-rules',
-    '-C', spec.cwd,
+    '-C', spec.callerUser ? '.' : spec.cwd,
     '-m', spec.model,
   ];
   if (schemaPath) args.push('--output-schema', schemaPath);
@@ -326,7 +327,8 @@ export function bwrapArgs(spec: CodexAgentSpec, env: Record<string, string>): st
   for (const d of binMounts([spec.codexBin, process.execPath])) args.push(...roBindTry(d));
   for (const p of spec.extraRoBinds) args.push(...roBindTry(p));
   args.push('--bind', spec.homeDir, spec.homeDir);
-  args.push(spec.profile === 'write' ? '--bind' : '--ro-bind', spec.cwd, spec.cwd);
+  const bind = spec.profile === 'write' ? '--bind' : '--ro-bind';
+  args.push(spec.callerUser ? `${bind}-fd` : bind, spec.callerUser ? PINNED_CWD : spec.cwd, spec.cwd);
   args.push('--chdir', spec.cwd, '--clearenv');
   for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
   args.push('--', spec.codexBin);
@@ -345,9 +347,9 @@ function priceable(u: Usage): Record<string, number> {
 
 export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: AbortSignal, onActivity: (a: Activity) => void): Promise<CodexOutcome> {
   const started = Date.now();
-  mkdirSync(join(spec.homeDir, 'tmp'), { recursive: true, mode: 0o700 });
+  if (!spec.callerUser) mkdirSync(join(spec.homeDir, 'tmp'), { recursive: true, mode: 0o700 });
   const schemaPath = spec.schema ? join(spec.homeDir, 'schema.json') : null;
-  if (schemaPath) writeFileSync(schemaPath, JSON.stringify(strictSchema(spec.schema)));
+  if (schemaPath && !spec.callerUser) writeFileSync(schemaPath, JSON.stringify(strictSchema(spec.schema)));
 
   // Usage accounting lives in the meter callback: it sees every response,
   // including the ones of an agent killed mid-turn.
@@ -380,12 +382,13 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
     },
   });
 
-  writeFileSync(join(spec.homeDir, 'config.toml'), renderConfig(spec, slot), { mode: 0o600 });
+  const configText = renderConfig(spec, slot);
+  if (!spec.callerUser) writeFileSync(join(spec.homeDir, 'config.toml'), configText, { mode: 0o600 });
 
   // The daemon's own node goes first on PATH: an npm-installed codex is a
   // `#!/usr/bin/env node` script, and inside the sandbox only what we mount exists.
   const nodeDir = dirname(process.execPath);
-  const basePath = process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin';
+  const basePath = spec.callerUser ? '/usr/local/bin:/usr/bin:/bin' : process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin';
   const env: Record<string, string> = {
     PATH: basePath.split(':').includes(nodeDir) ? basePath : `${nodeDir}:${basePath}`,
     HOME: spec.homeDir,
@@ -397,17 +400,16 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   };
   const codexArgs = buildArgs(spec, schemaPath);
   const [cmd, args] = spec.sandbox === 'bwrap'
-    ? ['bwrap', [...bwrapArgs(spec, env), ...codexArgs]]
+    ? [spec.callerUser ? '/usr/bin/bwrap' : 'bwrap', [...bwrapArgs(spec, env), ...codexArgs]]
     : [spec.codexBin, codexArgs];
 
   const out = createWriteStream(spec.streamPath, { flags: 'a' });
-  const child = spawn(cmd, args, {
-    cwd: spec.cwd,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true, // own process group, so the CLI's commands die with it
-  });
-  if (child.pid !== undefined) trackAgentGroup(child.pid);
+  const files = spec.callerUser ? { home: spec.homeDir, files: {
+    'config.toml': configText,
+    ...(schemaPath ? { 'schema.json': JSON.stringify(strictSchema(spec.schema)) } : {}),
+  } } : undefined;
+  const child = spawnAgent(cmd, args, spec.cwd, env, spec.prompt, spec.callerUser, files);
+  if (child.pid !== undefined) trackAgentGroup(child.pid, spec.callerUser ? (sig) => signalAgent(child, sig) : undefined);
 
   let lastText = '';
   let failure: string | null = null;
@@ -415,8 +417,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   let stderrTail = '';
 
   const killGroup = (sig: NodeJS.Signals) => {
-    if (child.pid === undefined) return;
-    try { process.kill(-child.pid, sig); } catch { /* already gone */ }
+    signalAgent(child, sig);
   };
   stop = (why, detail) => {
     if (endReason) return;
@@ -428,9 +429,6 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   const onAbort = () => stop('cancelled', '');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
   const timer = spec.timeoutMs === null ? undefined : setTimeout(() => stop('timeout', ''), spec.timeoutMs);
-
-  child.stdin.on('error', () => { /* child died before reading the prompt */ });
-  child.stdin.end(spec.prompt);
 
   let buf = '';
   child.stdout.on('data', (chunk: Buffer) => {
@@ -489,7 +487,10 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
       if (child.pid !== undefined) untrackAgentGroup(child.pid);
       meter.release(slot.bearer);
       out.end();
-      try { rmSync(spec.homeDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      try {
+        if (spec.callerUser) userOperation(spec.callerUser, { op: 'remove', path: spec.homeDir });
+        else rmSync(spec.homeDir, { recursive: true, force: true });
+      } catch { /* best effort */ }
       const durationMs = Date.now() - started;
       // The meter saw nothing (a body it could not parse) but the CLI counted
       // its turn: take the CLI's word rather than report a free agent.

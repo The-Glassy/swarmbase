@@ -633,6 +633,7 @@ export class RunManager {
         runId: meta.id, n, label: a.label, prompt, schema: a.schema, model: a.model, effort: a.effort, profile: a.profile,
         cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved.usd, streamPath: this.store.agentStreamPath(meta, n),
         apiKey: readApiKey(run.caller.apiKeyFile), dataDir: realpathSync(this.cfg.dataDir),
+        callerUser: this.store.userContext(meta),
       };
       if (a.engine === 'codex') {
         const codex = this.cfg.engines.codex;
@@ -656,6 +657,7 @@ export class RunManager {
           apiBaseUrl: this.cfg.engines.claude.baseUrl,
           claudeBin: this.cfg.engines.claude.bin,
           emptyMcpConfigPath: this.emptyMcpConfigPath,
+          homeDir: this.store.userContext(meta) ? this.store.agentHomeDir(meta, n) : undefined,
         }, slot.ac.signal, onActivity);
       }
     } catch (e) {
