@@ -87,6 +87,7 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
   for (const c of cfg.callers) {
     if (c.apiKeyFile) c.apiKeyFile = resolve(c.apiKeyFile);
     if (c.authTokenFile) c.authTokenFile = resolve(c.authTokenFile);
+    if (c.codexAuthFile) c.codexAuthFile = resolve(c.codexAuthFile);
     if (c.agentMcp) c.agentMcp.configPath = resolve(c.agentMcp.configPath);
   }
   if (process.platform !== 'linux') throw new Error('runAs requires Linux');
@@ -129,7 +130,7 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
         throw new Error(`runAs: daemon needs traversal of '${root}': usermod -aG ${c.runAs} <daemon>; chmod 2750 '${root}'; restart the daemon's login/service`);
       }
     }
-    for (const file of [c.apiKeyFile, c.authTokenFile, c.agentMcp?.configPath].filter((p): p is string => !!p)) accessSync(file, constants.R_OK);
+    for (const file of [c.apiKeyFile, c.authTokenFile, c.codexAuthFile, c.agentMcp?.configPath].filter((p): p is string => !!p)) accessSync(file, constants.R_OK);
     users.set(c.name, user);
   }
   // Private daemon data includes records, outbox, and all keys/bearers under it.
@@ -137,7 +138,7 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
   if (daemon.uid !== process.getuid?.() || (daemon.mode & 0o077)) throw new Error(`runAs: chown <daemon> '${cfg.dataDir}' && chmod 0700 '${cfg.dataDir}'`);
   for (const [name, user] of users) {
     const paths = [cfg.dataDir, ...(cfg.configPath ? [cfg.configPath] : []),
-      ...cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile, c.agentMcp?.configPath]).filter((p): p is string => !!p),
+      ...cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile, c.codexAuthFile, c.agentMcp?.configPath]).filter((p): p is string => !!p),
       ...cfg.callers.filter((c) => c.name !== name).flatMap((c) => [...(c.homeDir ? [c.homeDir] : []), ...c.cwdRoots])];
     const checks = operation(user, { op: 'check', paths });
     assertNoCallerAccess(user, checks.paths);

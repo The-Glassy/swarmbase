@@ -38,12 +38,14 @@ async function main(): Promise<void> {
   const store = new RunStore(cfg.dataDir, callerUsers);
   const notifier = new Notifier(cfg, store);
   let meter: UsageMeter | null = null;
-  if (cfg.engines.codex.baseUrl) {
+  if (cfg.engines.codex.baseUrl || cfg.callers.some((c) => c.engines.includes('codex'))) {
     if (cfg.engines.codex.sandbox === 'bwrap' && !bwrapAvailable()) {
       throw new Error('engines.codex.sandbox is "bwrap" but bubblewrap (bwrap) is not on PATH: install it, or set sandbox to "none" (the CLI\'s own deny-list only)');
     }
-    meter = new UsageMeter();
-    await meter.start();
+    if (cfg.engines.codex.baseUrl && cfg.callers.some((c) => c.engines.includes('codex') && !c.codexAuthFile)) {
+      meter = new UsageMeter();
+      await meter.start();
+    }
     log(`codex engine on (${cfg.engines.codex.sandbox === 'bwrap' ? 'bubblewrap wrapper' : 'NO OS wrapper: the CLI deny-list is the only read barrier; codex shells go to write-trusted callers only'})`);
   }
   const runs = new RunManager(cfg, store, ensureEmptyMcpConfig(cfg.dataDir), notifier, meter);

@@ -37,8 +37,7 @@ export interface CodexEngineConfig {
    *  mounts a real path. */
   bin: string;
   /** Responses-API endpoint the agents run against, e.g. `https://<gateway>/codex`.
-   *  null = the engine is not offered (there is no vendor default: the CLI's own
-   *  login mode would use the operator's ChatGPT account). */
+   *  Optional for callers with codexAuthFile (the default ChatGPT backend). */
   baseUrl: string | null;
   /** OS-level confinement around the CLI: `bwrap` (an allow-list of mounts; the
    *  default, and startup fails when bubblewrap is missing) or `none` (the CLI's
@@ -58,7 +57,7 @@ export interface CallerPolicy {
   /** sha256 hex of the caller's MCPL WebSocket token. */
   tokenSha256: string;
   /** File holding the API key (or inference-gateway token) this caller's agents run on.
-   *  The codex engine needs it (its gateway token). */
+   *  Gateway-mode Codex needs it; ChatGPT-mode Codex uses codexAuthFile. */
   apiKeyFile: string | null;
   /** File holding a Claude subscription token (`claude setup-token`), for the claude
    *  engine. Passed as CLAUDE_CODE_OAUTH_TOKEN and, when set, used instead of apiKeyFile,
@@ -68,6 +67,8 @@ export interface CallerPolicy {
   runAs?: string;
   /** Per-caller workspace root; defaults to the Linux account's home. */
   homeDir?: string;
+  /** Absolute path to a ChatGPT-login auth.json; overrides Codex gateway mode. */
+  codexAuthFile?: string | null;
   engines: EngineName[];
   /** Highest tool profile this caller's subagents may run with. */
   maxProfile: Profile;
@@ -237,7 +238,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   if (!(Number(codex.maxTokensDefault) > 0)) throw new Error('config: engines.codex.maxTokensDefault must be a positive number');
   if (!(Number(codex.maxTokensMax) >= codex.maxTokensDefault)) throw new Error('config: engines.codex.maxTokensMax must be at least maxTokensDefault');
   codex.extraRoBinds = (codex.extraRoBinds ?? []).map((p) => resolve(expand(String(p))));
-  if (codex.baseUrl) {
+  if (codex.baseUrl || raw.callers?.some((c) => c.engines?.includes('codex') && c.codexAuthFile)) {
     const bin = resolveOnPath(String(codex.bin), pathEnv);
     if (!bin || !isAbsolute(bin)) throw new Error(`config: engines.codex.bin ${JSON.stringify(codex.bin)} was not found on PATH; give its absolute path`);
     codex.bin = bin;
@@ -261,7 +262,7 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
   for (const c of cfg.callers) {
     if (names.has(c.name)) throw new Error(`config: duplicate caller "${c.name}"`);
     names.add(c.name);
-    if (c.engines.includes('codex') && !codex.baseUrl) {
+    if (c.engines.includes('codex') && !c.codexAuthFile && !codex.baseUrl) {
       throw new Error(`config: caller ${c.name} lists the codex engine but engines.codex.baseUrl is not set`);
     }
   }
@@ -271,7 +272,6 @@ export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? 
 function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   if (!c.name || !/^[a-z0-9][a-z0-9_-]{0,40}$/.test(c.name)) throw new Error(`config: bad caller name ${JSON.stringify(c.name)}`);
   if (!c.tokenSha256 || !/^[0-9a-f]{64}$/.test(c.tokenSha256)) throw new Error(`config: caller ${c.name} needs tokenSha256 (64 hex)`);
-  if (!c.apiKeyFile && !c.authTokenFile) throw new Error(`config: caller ${c.name} needs apiKeyFile or authTokenFile`);
   if (c.runAs !== undefined && (typeof c.runAs !== 'string' || !/^[a-z_][a-z0-9_-]{0,31}$/.test(c.runAs) || c.runAs === 'root')) {
     throw new Error(`config: caller ${c.name} runAs must be a non-root Linux username`);
   }
@@ -283,8 +283,12 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   const engines = c.engines ?? ['claude'];
   for (const e of engines) if (!ENGINES.includes(e)) throw new Error(`config: caller ${c.name} unknown engine ${JSON.stringify(e)} (${ENGINES.join(' | ')})`);
   if (!engines.length) throw new Error(`config: caller ${c.name} lists no engines`);
-  if (engines.includes('codex') && !c.apiKeyFile) {
-    throw new Error(`config: caller ${c.name} lists the codex engine, which needs apiKeyFile (its gateway token); authTokenFile is for claude only`);
+  if (engines.includes('claude') && !c.apiKeyFile && !c.authTokenFile) throw new Error(`config: caller ${c.name} needs apiKeyFile or authTokenFile for claude`);
+  if (c.codexAuthFile != null && (typeof c.codexAuthFile !== 'string' || !isAbsolute(c.codexAuthFile) || GLOB_CHARS_RE.test(c.codexAuthFile))) {
+    throw new Error(`config: caller ${c.name} codexAuthFile must be an absolute path without glob characters`);
+  }
+  if (engines.includes('codex') && !c.codexAuthFile && !c.apiKeyFile) {
+    throw new Error(`config: caller ${c.name} lists the codex engine, which needs apiKeyFile + engines.codex.baseUrl or codexAuthFile; authTokenFile is for claude only`);
   }
   const defaultModels: Record<EngineName, string> = {
     ...DEFAULT_MODELS,
@@ -297,6 +301,7 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
     apiKeyFile: c.apiKeyFile ? expand(c.apiKeyFile) : null,
     authTokenFile: c.authTokenFile ? expand(c.authTokenFile) : null,
     ...(c.runAs ? { runAs: c.runAs, ...(c.homeDir ? { homeDir: resolve(c.homeDir) } : {}) } : {}),
+    codexAuthFile: c.codexAuthFile ?? null,
     engines,
     maxProfile,
     cwdRoots: (c.cwdRoots ?? []).map((r) => resolve(expand(r))),
@@ -320,8 +325,8 @@ const MCP_TOOL_RE = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
 const GLOB_CHARS_RE = /[*?[\]{}\\]/;
 
 function validateAgentMcp(caller: string, engines: EngineName[], m: Partial<AgentMcp>): AgentMcp {
-  // the codex engine has no equivalent wiring yet; refuse rather than silently run its agents without the tools
-  if (engines.includes('codex')) throw new Error(`config: caller ${caller} agentMcp is supported by the claude engine only; drop codex from its engines`);
+  // Mixed-engine callers may use MCP on Claude; Codex never receives this config.
+  if (!engines.includes('claude')) throw new Error(`config: caller ${caller} agentMcp needs the claude engine`);
   const configPath = typeof m.configPath === 'string' ? expand(m.configPath) : '';
   if (!isAbsolute(configPath)) throw new Error(`config: caller ${caller} agentMcp.configPath must be an absolute path`);
   let real = configPath;

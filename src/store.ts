@@ -66,7 +66,7 @@ export type RunEvent = { seq: number; ts: string } & (
   | { type: 'agent_queued'; n: number; label: string; phase: string | null; engine: string; model: string; profile: Profile; effort: string | null; promptPreview: string }
   | { type: 'agent_start'; n: number }
   | { type: 'agent_activity'; n: number; kind: string; summary: string }
-  | { type: 'agent_end'; n: number; status: AgentStatus; costUsd: number; durationMs: number; error?: string; resultPreview?: string; usage?: unknown }
+  | { type: 'agent_end'; n: number; status: AgentStatus; costUsd: number; durationMs: number; error?: string; resultPreview?: string; usage?: unknown; billing?: 'subscription' }
   | { type: 'run_end'; status: RunStatus; spentUsd: number; spentTokens?: number; error: string | null }
 );
 

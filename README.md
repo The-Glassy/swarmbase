@@ -359,3 +359,44 @@ allowlist blocks DNS rebinding.
 - The runner sandbox is defense in depth. Node 20's permission model doesn't restrict network.
 - On a machine without a tailnet tag, a request to its own tailnet name carries its owner's login, with no forging needed. Subagents' `WebFetch` is denied every `*.ts.net` host for this reason, but a `write` agent's Bash isn't confined. Tag the host if that matters to you: its own connections then carry no identity.
 - The dashboard trusts `Tailscale-User-Login`, which `tailscale serve` sets itself and strips from clients. That holds only through serve: anything reaching the port directly can send the header. So keep `host` on loopback. A process on the machine can still forge a listed login, and that includes a subagent shell with network, even a wrapped codex shell that can't read `~/.swarmbase`. It's one more reason `write` is for trusted callers only.
+- The dashboard trusts `Tailscale-User-Login`. A local process running as the same user could forge it, but it could also read `~/.swarmbase` directly.
+
+### Codex with a ChatGPT login
+
+A caller may set `codexAuthFile` to an absolute path containing a file-based
+ChatGPT login produced by `codex login --device-auth`. That caller needs neither
+an API key nor `engines.codex.baseUrl` for Codex; a mixed Claude/Codex caller still
+needs Claude credentials. Login mode takes precedence if gateway settings are
+also present. Claude's `agentMcp` remains Claude-only for mixed-engine callers.
+
+Subscription agents use the default Codex backend without the usage proxy. Their
+`agent_end` events carry `billing: "subscription"` and `costUsd: 0`; CLI JSON usage
+is recorded when available. `maxUsd` cannot be enforced. Token reservations still
+limit scheduling, but the CLI reports tokens at turn end, so neither a token nor
+USD cap can interrupt an oversized turn in this mode. `timeoutMs` and cancellation
+still kill the process group. Interrupted agents may report zero tokens.
+
+For a `runAs` caller, the daemon reads the private master and passes its contents
+on the helper's stdin. The helper creates a caller-owned 0600 `auth.json` in a
+0700 throwaway Codex home, never a link or mount to the master. After exit, the
+helper reads valid private JSON as the caller, returns it over a pipe, and the
+daemon saves refreshes to the master before removing the home. Subscription runs
+sharing a master are serialized to avoid refresh races. The caller can access its
+own staged login; other callers cannot. Keep the master daemon-owned 0600 under
+a daemon-owned 0700 directory. Routine deployment must preserve live refreshes.
+
+For a legacy caller, the master login is mounted read-write at the throwaway `CODEX_HOME/auth.json`
+under bwrap, or symlinked there with sandbox `none`, to preserve token refreshes.
+Do not overwrite the live master on redeploy. Concurrent agents can race token
+refresh; coordinate login replacement while idle. File mounts/symlinks require
+the CLI's credential writer to update the file in place; atomic replacement
+writers may fail on a file bind or replace a symlink instead of updating its
+source. Verify refresh behavior with the pinned CLI before production use.
+
+Every caller's login path is denied to Claude file tools and Codex shell
+permission profiles, including the Codex agent's own `CODEX_HOME/auth.json` alias.
+That alias deny is defense in depth, **not a proven credential boundary**: the
+outer Codex process must access the login, and its outer bwrap mount also exposes
+it to children. Do not assume a hostile Codex shell cannot obtain it, especially
+with sandbox `none` or a write/network profile. Claude write-profile Bash is also
+unconfined, as before. Think has no shell tools.

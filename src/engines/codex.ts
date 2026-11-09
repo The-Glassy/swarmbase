@@ -1,5 +1,6 @@
 /**
  * `codex` engine — one `codex exec --json` process per agent() call, pointed
+ * via a caller's ChatGPT login (no meter, $0 subscription accounting), or
  * through the daemon's UsageMeter at the configured Responses endpoint (an
  * inference gateway's codex leg). Same contract as the claude engine:
  * AgentOutcome, activity events, process-group kill.
@@ -16,8 +17,9 @@
  *    CLI that mounts only /usr (+ the usual symlinks), a few /etc files, the
  *    agent's cwd and its throwaway CODEX_HOME. The CLI's inner sandbox nests
  *    inside it (verified). `sandbox: "none"` leaves the deny-list alone.
- *  - A throwaway CODEX_HOME per agent: config, auth (none: the meter bearer is
- *    a provider header), logs, sqlite state. Deleted when the agent ends.
+ *  - A throwaway CODEX_HOME per agent: config, logs, sqlite state. Gateway auth
+ *    is a provider header; ChatGPT auth is a shared master file bind/symlink.
+ *    The throwaway home is deleted when the agent ends, never the master.
  *    `--ephemeral` keeps rollouts off disk; `--ignore-rules` skips execpolicy
  *    files a workspace could plant; the workspace is never trusted, so a
  *    `.codex/` dir in it is ignored.
@@ -37,7 +39,8 @@
  *    Without a price row the agent costs $0 and the token budget is the limit
  *    (the ChatGPT backend is subscription-metered). When the meter saw no
  *    usage (a response it could not parse), the CLI's own `turn.completed`
- *    count is used instead.
+ *    count is used instead. Subscription mode has no meter, records $0, and
+ *    cannot enforce USD or mid-turn token caps; wall-clock timeout still applies.
  *
  * Gotchas:
  *  - Prompt on stdin (`-`); with a prompt argument and a non-TTY stdin the CLI
@@ -47,7 +50,7 @@
  *  - `item.type: "error"` items are advisory ("model metadata not found"):
  *    a run fails on `turn.failed`, `error`, or a non-zero exit only.
  */
-import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { Profile } from '../config.js';
@@ -74,7 +77,9 @@ export interface CodexAgentSpec {
   /** The caller's gateway token, held by the meter, never by the CLI. */
   apiKey: string;
   /** Responses endpoint, e.g. https://gate/codex */
-  baseUrl: string;
+  baseUrl: string | null;
+  /** Master ChatGPT login, never read by the daemon. Shared read-write for refresh. */
+  codexAuthFile?: string | null;
   codexBin: string;
   sandbox: 'bwrap' | 'none';
   extraRoBinds: string[];
@@ -208,11 +213,14 @@ export function strictSchemaProblem(schema: unknown): string | null {
 }
 
 /** The agent's CODEX_HOME/config.toml. */
-export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bearer: string }): string {
-  const deny = denyPaths(spec.dataDir, spec.homeDir, spec.denyExtra, spec.cwd).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
+export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bearer: string } | null = null): string {
+  if (spec.codexAuthFile) meter = null; // caller login always takes precedence
+  // Only add the auth alias when present; gateway homes have no auth.json.
+  const deny = denyPaths(spec.dataDir, spec.homeDir, [...spec.denyExtra,
+    ...(spec.codexAuthFile ? [join(spec.homeDir, 'auth.json')] : [])], spec.cwd).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
   const lines = [
     `model = ${tomlStr(spec.model)}`,
-    'model_provider = "swarmbase"',
+    ...(meter ? ['model_provider = "swarmbase"'] : ['cli_auth_credentials_store = "file"']),
     `default_permissions = ${tomlStr(PROFILE_NAMES[spec.profile])}`,
     ...(spec.effort ? [`model_reasoning_effort = ${tomlStr(spec.effort)}`] : []),
     'approval_policy = "never"',
@@ -233,13 +241,15 @@ export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bea
     '[tools.experimental_request_user_input]',
     'enabled = false',
     '',
-    '[model_providers.swarmbase]',
-    'name = "SwarmBase meter"',
-    `base_url = ${tomlStr(meter.baseUrl)}`,
-    'wire_api = "responses"',
-    `http_headers = { "authorization" = ${tomlStr(`Bearer ${meter.bearer}`)} }`,
-    'request_max_retries = 2',
-    'stream_max_retries = 2',
+    ...(meter ? [
+      '[model_providers.swarmbase]',
+      'name = "SwarmBase meter"',
+      `base_url = ${tomlStr(meter.baseUrl)}`,
+      'wire_api = "responses"',
+      `http_headers = { "authorization" = ${tomlStr(`Bearer ${meter.bearer}`)} }`,
+      'request_max_retries = 2',
+      'stream_max_retries = 2',
+    ] : []),
     '',
     '[permissions.swarm-think]',
     'extends = ":read-only"',
@@ -327,6 +337,10 @@ export function bwrapArgs(spec: CodexAgentSpec, env: Record<string, string>): st
   for (const d of binMounts([spec.codexBin, process.execPath])) args.push(...roBindTry(d));
   for (const p of spec.extraRoBinds) args.push(...roBindTry(p));
   args.push('--bind', spec.homeDir, spec.homeDir);
+  // The CLI must read/write the login to refresh it. This outer mount also exposes
+  // it to the CLI's children: only the inner permission deny attempts to hide it
+  // from shell tools. It is not a strong credential boundary for a Codex agent.
+  if (spec.codexAuthFile && !spec.callerUser) args.push('--bind', spec.codexAuthFile, join(spec.homeDir, 'auth.json'));
   const bind = spec.profile === 'write' ? '--bind' : '--ro-bind';
   args.push(spec.callerUser ? `${bind}-fd` : bind, spec.callerUser ? PINNED_CWD : spec.cwd, spec.cwd);
   args.push('--chdir', spec.cwd, '--clearenv');
@@ -345,7 +359,9 @@ function priceable(u: Usage): Record<string, number> {
   return { input_tokens: Math.max(0, u.inputTokens - u.cachedInputTokens), cache_read_input_tokens: u.cachedInputTokens, output_tokens: u.outputTokens };
 }
 
-export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: AbortSignal, onActivity: (a: Activity) => void): Promise<CodexOutcome> {
+function runCodexAgentUnlocked(spec: CodexAgentSpec, meter: UsageMeter | null, signal: AbortSignal, onActivity: (a: Activity) => void): Promise<CodexOutcome> {
+  const subscription = !!spec.codexAuthFile;
+  if (!subscription && (!meter || !spec.baseUrl)) throw new Error('Codex gateway mode needs a meter and baseUrl');
   const started = Date.now();
   if (!spec.callerUser) mkdirSync(join(spec.homeDir, 'tmp'), { recursive: true, mode: 0o700 });
   const schemaPath = spec.schema ? join(spec.homeDir, 'schema.json') : null;
@@ -362,8 +378,8 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   const lastUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
   let stop: (why: string, detail: string) => void = () => { /* bound below */ };
 
-  const slot = meter.register({
-    upstream: spec.baseUrl,
+  const slot = subscription ? null : meter!.register({
+    upstream: spec.baseUrl!,
     bearer: spec.apiKey,
     headers: {
       'x-gate-origin': 'swarmbase',
@@ -382,6 +398,13 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
     },
   });
 
+  // No credential contents pass through the daemon. With no wrapper, link directly
+  // to the master; with bwrap, create the target and bind the master over it.
+  if (spec.codexAuthFile && !spec.callerUser) {
+    const target = join(spec.homeDir, 'auth.json');
+    if (spec.sandbox === 'bwrap') writeFileSync(target, '', { mode: 0o600 });
+    else symlinkSync(spec.codexAuthFile, target);
+  }
   const configText = renderConfig(spec, slot);
   if (!spec.callerUser) writeFileSync(join(spec.homeDir, 'config.toml'), configText, { mode: 0o600 });
 
@@ -406,6 +429,7 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
   const out = createWriteStream(spec.streamPath, { flags: 'a' });
   const files = spec.callerUser ? { home: spec.homeDir, files: {
     'config.toml': configText,
+    ...(spec.codexAuthFile ? { 'auth.json': readFileSync(spec.codexAuthFile, 'utf8') } : {}),
     ...(schemaPath ? { 'schema.json': JSON.stringify(strictSchema(spec.schema)) } : {}),
   } } : undefined;
   const child = spawnAgent(cmd, args, spec.cwd, env, spec.prompt, spec.callerUser, files);
@@ -485,12 +509,17 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
       if (child.pid !== undefined) untrackAgentGroup(child.pid);
-      meter.release(slot.bearer);
+      if (slot) meter!.release(slot.bearer);
       out.end();
       try {
+        if (spec.callerUser && spec.codexAuthFile) {
+          // The helper opens as the caller; never follow its path with daemon authority.
+          const auth = userOperation(spec.callerUser, { op: 'readAuth', path: join(spec.homeDir, 'auth.json') });
+          writeFileSync(spec.codexAuthFile, JSON.stringify(auth), { mode: 0o600 });
+        }
         if (spec.callerUser) userOperation(spec.callerUser, { op: 'remove', path: spec.homeDir });
         else rmSync(spec.homeDir, { recursive: true, force: true });
-      } catch { /* best effort */ }
+      } catch { failure = 'private Codex auth refresh/cleanup failed'; }
       const durationMs = Date.now() - started;
       // The meter saw nothing (a body it could not parse) but the CLI counted
       // its turn: take the CLI's word rather than report a free agent.
@@ -499,10 +528,14 @@ export function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter, signal: A
         const u: Usage = { inputTokens: Number(t.input_tokens ?? 0), cachedInputTokens: Number(t.cached_input_tokens ?? 0), outputTokens: Number(t.output_tokens ?? 0), model: null };
         tokens = u.inputTokens + u.outputTokens;
         lastUsage.inputTokens = u.inputTokens; lastUsage.cachedInputTokens = u.cachedInputTokens; lastUsage.outputTokens = u.outputTokens;
-        if (priceFor(spec.model)) costUsd = estimateCost(spec.model, priceable(u)); else unpriced = true;
+        if (!subscription) {
+          if (priceFor(spec.model)) costUsd = estimateCost(spec.model, priceable(u)); else unpriced = true;
+        }
       }
       const usage = { ...lastUsage, tokens, turn: turnUsage };
-      const base = { costUsd, durationMs, usage, unpriced, tokens };
+      // Subscription has no metered USD cost or mid-turn token visibility. maxUsd
+      // cannot be enforced; timeout/cancellation still kill the process group.
+      const base = { costUsd, durationMs, usage, unpriced, tokens, ...(subscription ? { billing: 'subscription' as const } : {}) };
       const fail = (error: string, reason: string) => resolve({ ok: false, result: null, error, reason, ...base });
 
       if (endReason === 'cancelled' || endReason === 'timeout') { fail(endReason, endReason); return; }
@@ -538,4 +571,18 @@ export function looksLikeCodexAgent(cmd: string): boolean {
 export function bwrapAvailable(): boolean {
   for (const d of (process.env.PATH ?? '').split(':')) if (d && existsSync(join(d, 'bwrap'))) return true;
   return false;
+}
+
+const authQueues = new Map<string, Promise<void>>();
+/** One refresh writer per caller login. API mode retains normal parallelism. */
+export async function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter | null, signal: AbortSignal, onActivity: (a: Activity) => void): Promise<CodexOutcome> {
+  if (!spec.codexAuthFile) return runCodexAgentUnlocked(spec, meter, signal, onActivity);
+  const key = realpathSync(spec.codexAuthFile);
+  const previous = authQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((r) => { release = r; });
+  authQueues.set(key, current);
+  await previous;
+  try { return await runCodexAgentUnlocked(spec, meter, signal, onActivity); }
+  finally { release(); if (authQueues.get(key) === current) authQueues.delete(key); }
 }

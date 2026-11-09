@@ -401,7 +401,7 @@ export class RunManager {
 
     const engine = (opts.engine ?? 'claude') as EngineName;
     if (!caller.engines.includes(engine)) throw new Error(`engine "${opts.engine}" is not available to you (available: ${caller.engines.join(', ')})`);
-    if (engine === 'codex' && !this.meter) throw new Error('engine "codex" is not configured on this SwarmBase');
+    if (engine === 'codex' && !caller.codexAuthFile && !this.meter) throw new Error('engine "codex" is not configured on this SwarmBase');
 
     const defaultProfile: Profile = profileRank(caller.maxProfile) >= profileRank('read') ? 'read' : caller.maxProfile;
     const profile = (opts.profile ?? d.profile ?? defaultProfile) as Profile;
@@ -638,7 +638,7 @@ export class RunManager {
       // Every caller's API key and subscription token files: no agent may read its own
       // caller's credentials or another's. Claude's rules are strings (configured and resolved
       // paths); codex's sandbox mounts over what it denies, so it gets existing paths only.
-      const credFiles = this.cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile]).filter((f): f is string => !!f);
+      const credFiles = this.cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile, c.codexAuthFile]).filter((f): f is string => !!f);
       const credReal = credFiles.map(safeRealpath).filter((p): p is string => !!p);
       const secretFiles = [...new Set([...credFiles, ...credReal])];
       // Every caller's agent MCP config (it holds that caller's MCP credentials), as configured and resolved.
@@ -650,15 +650,17 @@ export class RunManager {
         if (reserved.tokens < a.maxTokens) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: maxTokens ${a.maxTokens} cut to ${reserved.tokens}, what is left of the run's token budget` });
         const o = await runCodexAgent({
           ...common,
-          apiKey: readApiKey(run.caller.apiKeyFile!), // config requires it for codex callers
+          apiKey: run.caller.codexAuthFile ? '' : readApiKey(run.caller.apiKeyFile!),
+          codexAuthFile: run.caller.codexAuthFile,
           maxTokens: reserved.tokens,
           homeDir: this.store.agentHomeDir(meta, n),
-          baseUrl: codex.baseUrl!,
+          baseUrl: codex.baseUrl,
           codexBin: codex.bin,
           sandbox: codex.sandbox,
           extraRoBinds: codex.extraRoBinds,
           denyExtra: [...new Set(credReal), this.cfg.configPath, ...mcpReal].filter((p): p is string => !!p),
-        }, this.meter!, slot.ac.signal, onActivity);
+        }, this.meter, slot.ac.signal, onActivity);
+        if (o.billing === 'subscription') this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: ChatGPT subscription; $0 recorded, maxUsd cannot be enforced; token counts arrive at turn end, timeoutMs still applies` });
         if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 against the USD budget (set config.prices to shadow-price it); the run's token budget bounds it` });
         spentTokens = o.tokens;
         outcome = o;
@@ -698,6 +700,7 @@ export class RunManager {
     this.store.emit(meta.id, {
       type: 'agent_end', n, status, costUsd: outcome.costUsd, durationMs: outcome.durationMs,
       usage: outcome.usage ?? undefined,
+      ...(a.engine === 'codex' && run.caller.codexAuthFile ? { billing: 'subscription' as const } : {}),
       ...(outcome.ok ? { resultPreview: preview(outcome.result) } : { error }),
     });
     this.store.saveMeta(meta);

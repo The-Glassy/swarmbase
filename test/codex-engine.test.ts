@@ -16,6 +16,8 @@ import { test } from 'node:test';
 import { parseConfig, resolveOnPath } from '../src/config.js';
 import { normalizeTranscript } from '../src/dashboard.js';
 import { binMounts, bwrapArgs, bwrapAvailable, buildArgs, denyPaths, renderConfig, runCodexAgent, strictSchema, strictSchemaProblem, type CodexAgentSpec } from '../src/engines/codex.js';
+import { denyRules } from '../src/engines/claude.js';
+import { guideText } from '../src/guide.js';
 import { parseUsage, UsageMeter } from '../src/meter.js';
 
 const caller = { name: 'r', tokenSha256: 'a'.repeat(64), apiKeyFile: '/tmp/x.key' };
@@ -75,6 +77,7 @@ test('rendered CODEX_HOME: profile selected by default_permissions, never -s; th
   const read = renderConfig(spec(), meter);
   assert.match(read, /^default_permissions = "swarm-read"$/m);
   assert.match(read, /^model_provider = "swarmbase"$/m);
+  assert.doesNotMatch(read, /^"\/w\/home\/auth.json" = "deny"$/m, 'gateway homes have no auth file');
   assert.match(read, /^base_url = "http:\/\/127\.0\.0\.1:1\/m"$/m);
   assert.match(read, /http_headers = \{ "authorization" = "Bearer sbm_x" \}/);
   assert.match(read, /^"\/sb\/\*\.key" = "deny"$/m);
@@ -490,4 +493,93 @@ test('live: sandbox "none" — the CLI deny-list alone hides sibling bearers, th
     fs.rmSync(dataDir, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
   }
+});
+
+test('config: ChatGPT Codex needs no gateway or API key; mixed callers still validate independently', () => {
+  const p = fakePath();
+  const auth = { name: 'chat', tokenSha256: 'b'.repeat(64), engines: ['codex'], codexAuthFile: '/secrets/chat-login.json' };
+  try {
+    const cfg = parseConfig({ callers: [auth] } as any, p.dir);
+    assert.equal(cfg.callers[0].apiKeyFile, null);
+    assert.equal(cfg.callers[0].codexAuthFile, auth.codexAuthFile);
+    assert.equal(cfg.engines.codex.baseUrl, null);
+    assert.equal(cfg.engines.codex.bin, p.bin);
+    assert.throws(() => parseConfig({ callers: [auth] } as any, '/absent'), /was not found on PATH/);
+    assert.throws(() => parseConfig({ callers: [{ ...auth, codexAuthFile: 'relative.json' }] } as any, p.dir), /absolute path/);
+    assert.throws(() => parseConfig({ callers: [{ ...auth, codexAuthFile: '/secrets/*.json' }] } as any, p.dir), /glob characters/);
+    assert.throws(() => parseConfig({ callers: [auth, { ...caller, engines: ['codex'] }] } as any, p.dir), /baseUrl/);
+    assert.throws(() => parseConfig({ engines: { codex: { baseUrl: 'https://g/codex' } }, callers: [{ ...auth, codexAuthFile: null }] } as any, p.dir), /apiKeyFile/);
+    assert.throws(() => parseConfig({ callers: [{ ...auth, engines: ['claude', 'codex'] }] } as any, p.dir), /for claude/);
+    const mixed = parseConfig({ callers: [{ ...auth, authTokenFile: '/secrets/claude.oauth', engines: ['claude', 'codex'],
+      agentMcp: { configPath: '/secrets/browser.json', allowedTools: ['mcp__browser__read'] } }] } as any, p.dir);
+    assert.deepEqual(mixed.callers[0].agentMcp?.profiles, ['read', 'write']);
+  } finally { fs.rmSync(p.dir, { recursive: true, force: true }); }
+});
+
+test('renderConfig: without meter uses default ChatGPT provider and file credential store', () => {
+  const text = renderConfig(spec({ codexAuthFile: '/secrets/login.json', baseUrl: null }), { baseUrl: 'http://127.0.0.1:1', bearer: 'unused' });
+  assert.doesNotMatch(text, /model_provider|base_url|http_headers|swarmbase meter/i);
+  assert.match(text, /^cli_auth_credentials_store = "file"$/m);
+  assert.match(text, /^default_permissions = "swarm-read"$/m);
+  assert.match(text, /^"\/w\/home\/auth.json" = "deny"$/m);
+  assert.match(text, /^approval_policy = "never"$/m);
+});
+
+test('bwrapArgs: ChatGPT login is mounted read-write after its throwaway home', () => {
+  const args = bwrapArgs(spec({ codexAuthFile: '/secrets/login.json' }), {});
+  const i = args.indexOf('/secrets/login.json');
+  assert.deepEqual(args.slice(i - 1, i + 2), ['--bind', '/secrets/login.json', '/w/home/auth.json']);
+  assert.ok(i > args.indexOf('/w/home'));
+  assert.ok(!bwrapArgs(spec(), {}).includes('/secrets/login.json'));
+});
+
+test('subscription: fake CLI gets a symlink, no meter, zero USD despite a price row, token accounting and timeout', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-chatgpt-'));
+  const master = path.join(dir, 'login.fixture');
+  const fake = path.join(dir, 'codex.cjs');
+  // Only metadata and synthetic fixtures are used; no real login is opened.
+  fs.writeFileSync(master, '{}', { mode: 0o600 });
+  fs.writeFileSync(fake, `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const home = process.env.CODEX_HOME;
+if (!fs.lstatSync(path.join(home, 'auth.json')).isSymbolicLink()) process.exit(2);
+fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+if (process.argv.includes('claude-sonnet-5-5')) {
+  console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'done'}}));
+  console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:100,cached_input_tokens:20,output_tokens:10}}));
+} else setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+  const base = { cwd: dir, dataDir: dir, streamPath: path.join(dir, 'stream.jsonl'), sandbox: 'none' as const,
+    codexBin: fake, codexAuthFile: master, baseUrl: null, model: 'claude-sonnet-5-5', maxBudgetUsd: 0.00001, maxTokens: 1 };
+  try {
+    const unusedMeter = { register() { throw new Error('subscription must not register a meter'); }, release() { throw new Error('subscription must not release a meter'); } } as unknown as UsageMeter;
+    const o = await runCodexAgent(spec({ ...base, homeDir: path.join(dir, 'home') }), unusedMeter, new AbortController().signal, () => {});
+    assert.equal(o.ok, true, o.error ?? '');
+    assert.equal(o.billing, 'subscription');
+    assert.equal(o.costUsd, 0);
+    assert.equal(o.tokens, 110);
+    assert.equal((o.usage as any).cachedInputTokens, 20);
+    assert.equal(o.unpriced, false);
+    assert.ok(fs.existsSync(master), 'deleting throwaway home leaves master login intact');
+    const timeout = await runCodexAgent(spec({ ...base, model: 'hang', timeoutMs: 150, homeDir: path.join(dir, 'timeout-home') }), null, new AbortController().signal, () => {});
+    assert.equal(timeout.reason, 'timeout');
+    assert.equal(timeout.billing, 'subscription');
+    assert.equal(timeout.tokens, 0);
+    assert.equal(timeout.costUsd, 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('ChatGPT login path is denied to Claude Read and guide reflects caller engines and subscription limits', () => {
+  const paths = ['/secrets/chat-login.json', '/data/swarmbase/junga-codex-auth.json'];
+  assert.ok(paths.every((p) => denyRules('/data/swarmbase', paths).includes(`Read(/${p})`)));
+  const opts = { defaultModel: 'sonnet', defaultModels: { codex: 'gpt-x' }, maxProfile: 'read', budgetDefault: 2,
+    budgetMax: 10, tokensDefault: 1000, tokensMax: 10000, maxAgents: 20, perRun: 2, agentTimeoutMs: null, runTimeoutMs: 86400000, cwdRoots: [] };
+  const junga = guideText({ ...opts, engines: ['claude', 'codex'], codexSubscription: true });
+  assert.match(junga, /"claude" .* or "codex"/);
+  assert.match(junga, /maxUsd cannot be enforced/);
+  const glassy = guideText({ ...opts, engines: ['claude'] });
+  assert.match(glassy, /available to you: "claude"/);
+  assert.doesNotMatch(glassy, /or "codex"|billing: "subscription"/);
 });

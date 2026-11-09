@@ -64,6 +64,7 @@ export interface ClaudeAgentSpec {
 }
 
 export interface AgentOutcome {
+  billing?: 'subscription';
   ok: boolean;
   /** Structured object when a schema was given, else final text. */
   result: unknown;
