@@ -5,7 +5,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import { parseConfig, type Config } from '../src/config.js';
+import { parseConfig, type Config, type CallerPolicy } from '../src/config.js';
 import { denyRules, ensureEmptyMcpConfig } from '../src/engines/claude.js';
 import { RunManager } from '../src/runs.js';
 import { RunStore, type RunMeta } from '../src/store.js';
@@ -28,12 +28,12 @@ const keyFile = join(root, 'key');
 writeFileSync(keyFile, 'fake-key');
 
 let dirs = 0;
-function harness(limits: Partial<Config> = {}) {
+function harness(limits: Partial<Config> = {}, callerLimits: Partial<CallerPolicy> = {}) {
   const dataDir = join(root, `data-${++dirs}`);
   const cfg = parseConfig({
     dataDir,
     engines: { claude: { bin: fakeCli, baseUrl: null } } as Config['engines'],
-    callers: [{ name: 'nestor', tokenSha256: 'a'.repeat(64), apiKeyFile: keyFile, maxProfile: 'read' }] as Config['callers'],
+    callers: [{ name: 'nestor', tokenSha256: 'a'.repeat(64), apiKeyFile: keyFile, maxProfile: 'read', ...callerLimits }] as Config['callers'],
     ...limits,
   });
   const store = new RunStore(dataDir);
@@ -165,4 +165,21 @@ test('the extend tool: only your own running run, by a sane amount, and status s
 
 test('subagents can not fetch tailnet hosts', () => {
   assert.ok(denyRules('/data').includes('WebFetch(domain:*.ts.net)'));
+});
+
+test('caller agent ceiling spans runs and caller per-run ceiling overrides the global default', async () => {
+  const {store, start} = harness({maxConcurrentAgents:12, perRunConcurrency:12}, {maxConcurrentAgents:1, perRunConcurrency:1});
+  const a = start(fanOut(3, 0.15));
+  const b = start(fanOut(3, 0.15));
+  await Promise.all([a.done, b.done]);
+  const events = [a, b].flatMap(({meta}) => store.readEvents(meta.id))
+    .filter((e) => e.type === 'agent_start' || e.type === 'agent_end')
+    .sort((a, b) => a.ts.localeCompare(b.ts) || (a.type === 'agent_end' ? -1 : 1));
+  let now = 0, peak = 0;
+  for (const e of events) { now += e.type === 'agent_start' ? 1 : -1; peak = Math.max(peak, now); }
+  assert.equal(peak, 1, 'one caller cannot use another global slot through a second run');
+  for (const {meta} of [a, b]) {
+    assert.equal(store.get(meta.id)?.status, 'completed');
+    assert.equal(peakConcurrency(store, meta.id), 1);
+  }
 });
