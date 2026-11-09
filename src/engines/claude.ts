@@ -329,6 +329,17 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   const onAbort = () => stop('cancelled');
   if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
   const timer = spec.timeoutMs === null ? undefined : setTimeout(() => stop('timeout'), spec.timeoutMs);
+  // runAs's subreaper kills even detached descendants before its own exit.
+  // Legacy agents still need process-group cleanup when the CLI exits normally.
+  child.on('exit', () => {
+    if (spec.callerUser || endReason || child.pid === undefined) return;
+    const pgid = child.pid;
+    try { process.kill(-pgid, 'SIGTERM'); } catch { return; }
+    setTimeout(() => {
+      try { process.kill(-pgid, 0); process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ }
+    }, KILL_GRACE_MS).unref();
+  });
+
 
   let buf = '';
   child.stdout.on('data', (chunk: Buffer) => {
