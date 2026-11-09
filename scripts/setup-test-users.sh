@@ -26,6 +26,14 @@ for suffix in a b; do
   chmod 2750 "/home/$account"
   install -d -o "$account" -g "$account" -m 2750 "/home/$account/projects"
 done
+for suffix in a b; do
+  account=swarmbase-test-$suffix
+  getent group "$account-workspace" >/dev/null || groupadd "$account-workspace"
+  usermod -aG "$account-workspace" "$account"
+  usermod -aG "$account-workspace" swarmbase-test-daemon
+  install -d -o root -g "$account-workspace" -m 2750 "/srv/$account"
+  install -d -o root -g "$account-workspace" -m 2770 "/srv/$account/workspace"
+done
 install -d -o swarmbase-test-daemon -g swarmbase-test-daemon -m 0700 /home/swarmbase-test-daemon/state
 for suffix in a b; do
   key=/home/swarmbase-test-daemon/state/$suffix.key

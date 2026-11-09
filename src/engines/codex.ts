@@ -56,6 +56,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import type { Profile } from '../config.js';
 import { estimateCost, KILL_GRACE_MS, priceFor, trackAgentGroup, untrackAgentGroup, type Activity, type AgentOutcome } from './claude.js';
 import type { Usage, UsageMeter } from '../meter.js';
+import { Semaphore } from '../semaphore.js';
 import { PINNED_CWD, signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
 
 export interface CodexAgentSpec {
@@ -573,16 +574,15 @@ export function bwrapAvailable(): boolean {
   return false;
 }
 
-const authQueues = new Map<string, Promise<void>>();
+const authQueues = new Map<string, Semaphore>();
 /** One refresh writer per caller login. API mode retains normal parallelism. */
 export async function runCodexAgent(spec: CodexAgentSpec, meter: UsageMeter | null, signal: AbortSignal, onActivity: (a: Activity) => void): Promise<CodexOutcome> {
   if (!spec.codexAuthFile) return runCodexAgentUnlocked(spec, meter, signal, onActivity);
   const key = realpathSync(spec.codexAuthFile);
-  const previous = authQueues.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((r) => { release = r; });
-  authQueues.set(key, current);
-  await previous;
+  const gate = authQueues.get(key) ?? new Semaphore(1);
+  authQueues.set(key, gate);
+  try { await gate.acquire(signal); }
+  catch { return {ok:false, result:null, costUsd:0, durationMs:0, usage:null, error:'cancelled', reason:'cancelled', unpriced:false, tokens:0, billing:'subscription'}; }
   try { return await runCodexAgentUnlocked(spec, meter, signal, onActivity); }
-  finally { release(); if (authQueues.get(key) === current) authQueues.delete(key); }
+  finally { gate.release(); if (!gate.active && !gate.queued) authQueues.delete(key); }
 }

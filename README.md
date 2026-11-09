@@ -400,3 +400,25 @@ outer Codex process must access the login, and its outer bwrap mount also expose
 it to children. Do not assume a hostile Codex shell cannot obtain it, especially
 with sandbox `none` or a write/network profile. Claude write-profile Bash is also
 unconfined, as before. Think has no shell tools.
+
+### Shared tenant workspaces and a private dashboard
+
+`runAs` callers can opt into a tenant workspace group with `cwdGid`. Their
+`cwdRoots` may then be foreign-owned setgid directories with that gid, mode 2770,
+and no access for others. The caller must belong to that group. Keep caller homes
+on a separate private group (2750); give the daemon traversal of homes/workspaces,
+never give callers the daemon group. Startup probes still reject access to every
+other caller's roots, every credential, and writable protected ancestors. The
+helper pins a validated directory fd before launching either engine. Agent umask
+0007 preserves workspace collaboration; staged auth/config files remain 0600 in
+0700 homes. `maxConcurrentAgents` and `perRunConcurrency` on a caller override the
+global scheduling defaults for that caller.
+
+Set `dashboardSocket` to an absolute path in a daemon-owned runtime directory to
+move all dashboard HTTP routes off TCP. The TCP listener then accepts MCPL
+upgrades and public `/health` and `/metrics` only; a forged identity header cannot
+retrieve dashboard content there. The Unix socket is 0660. A trusted proxy can
+join the daemon group and connect to it, but agent users must never have that
+group or a route to that proxy. Enforce the latter with a UID firewall covering
+both the proxy's internal port and its externally published port. The homelab
+role additionally binds the proxy to loopback and publishes only on NetBird.

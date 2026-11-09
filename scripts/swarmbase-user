@@ -81,12 +81,15 @@ def launch(req, initial_control):
     if ctypes.CDLL(None, use_errno=True).prctl(38, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), 'PR_SET_NO_NEW_PRIVS')
     prepare(req.get('files'))
+    os.umask(0o007)
     # Open first, then validate the actual directory and chdir by fd. An agent
     # changing a symlink while a sibling starts cannot redirect this cwd.
     cwd_fd = os.open(os.path.realpath(req['cwd']), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         cwd = os.readlink('/proc/self/fd/%d' % cwd_fd)
-        if os.fstat(cwd_fd).st_uid != os.getuid() or not any(
+        st = os.fstat(cwd_fd)
+        shared = req.get('cwdGid') and st.st_gid == req['cwdGid'] and st.st_gid in os.getgroups() and st.st_mode & stat.S_ISGID and not st.st_mode & 0o007
+        if (st.st_uid != os.getuid() and not shared) or not any(
                 cwd == root or cwd.startswith(root.rstrip('/') + '/') for root in req['roots']):
             raise ValueError('cwd must be owned by caller and inside its configured roots')
         os.fchdir(cwd_fd)
@@ -169,7 +172,7 @@ def main():
                 bwrap_fd = '--bind-fd' in help_text and '--ro-bind-fd' in help_text
             except (OSError, subprocess.SubprocessError):
                 pass
-        print(json.dumps(dict(uid=os.getuid(), gid=os.getgid(), home=pwd.getpwuid(os.getuid()).pw_dir, paths=paths, bwrapFd=bwrap_fd)))
+        print(json.dumps(dict(uid=os.getuid(), gid=os.getgid(), home=pwd.getpwuid(os.getuid()).pw_dir, groups=os.getgroups(), paths=paths, bwrapFd=bwrap_fd)))
     elif op == 'readAuth':
         fd = os.open(req['path'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd) as f:

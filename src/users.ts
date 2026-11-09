@@ -5,7 +5,7 @@ import { accessSync, constants, lstatSync, realpathSync, statSync } from 'node:f
 import { dirname, join, resolve } from 'node:path';
 import type { Config } from './config.js';
 
-export interface CallerUser { user: string; root: string; helper: string; cwdRoots?: string[] }
+export interface CallerUser { user: string; root: string; helper: string; cwdRoots?: string[]; cwdGid?: number }
 export interface UserFiles { home: string; files: Record<string, string> }
 export const HELPER_ENV = { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' };
 /** Replaced by the helper with a validated directory fd, consumed by bwrap. */
@@ -25,7 +25,7 @@ export function buildAgentLaunch(command: string, args: string[], cwd: string, e
   prompt: string, user?: CallerUser, files?: UserFiles): AgentLaunch {
   if (!user) return { command, args, cwd, env, input: prompt, keepOpen: false };
   return { ...helperCommand(user), cwd: '/', env: HELPER_ENV, keepOpen: true,
-    input: JSON.stringify({ op: 'launch', command, args, cwd, env, prompt, files, roots: [user.root, ...(user.cwdRoots ?? [])] }) + '\n' };
+    input: JSON.stringify({ op: 'launch', command, args, cwd, env, prompt, files, roots: [user.root, ...(user.cwdRoots ?? [])], cwdGid: user.cwdGid }) + '\n' };
 }
 
 export function assertNoCallerAccess(user: CallerUser, entries: { path: string; read: boolean; write: boolean; execute: boolean; directory: boolean }[]): void {
@@ -115,12 +115,15 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
     }
     uids.add(info.uid);
     c.homeDir ??= info.home;
-    const user = { ...provisional, root: realpathSync(c.homeDir!), cwdRoots: c.cwdRoots.map((r) => realpathSync(r)) };
+    const user = { ...provisional, cwdGid: c.cwdGid, root: realpathSync(c.homeDir!), cwdRoots: c.cwdRoots.map((r) => realpathSync(r)) };
     c.homeDir = user.root;
     const roots = [user.root, ...c.cwdRoots];
     for (const root of roots) {
       const st = statSync(root);
-      if (!st.isDirectory() || st.uid !== info.uid || (st.mode & 0o007) || (st.mode & 0o020)) {
+      const tenantWorkspace = root !== user.root && c.cwdGid !== undefined
+        && st.gid === c.cwdGid && !!(st.mode & 0o2000) && info.groups?.includes(c.cwdGid);
+      const privateRoot = st.uid === info.uid && !(st.mode & 0o020);
+      if (!st.isDirectory() || (st.mode & 0o007) || !(tenantWorkspace || privateRoot)) {
         throw new Error(`runAs: root '${root}' must belong to ${c.runAs} with a private group: chown ${c.runAs}:${c.runAs} '${root}' && chmod 2750 '${root}'; add the daemon to group ${c.runAs} and restart its login/service`);
       }
       if (root === user.root && st.gid !== info.gid && !(st.mode & 0o2000)) {
@@ -130,7 +133,11 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
         throw new Error(`runAs: daemon needs traversal of '${root}': usermod -aG ${c.runAs} <daemon>; chmod 2750 '${root}'; restart the daemon's login/service`);
       }
     }
-    for (const file of [c.apiKeyFile, c.authTokenFile, c.codexAuthFile, c.agentMcp?.configPath].filter((p): p is string => !!p)) accessSync(file, constants.R_OK);
+    for (const file of [c.apiKeyFile, c.authTokenFile, c.codexAuthFile, c.agentMcp?.configPath].filter((p): p is string => !!p)) {
+      accessSync(file, constants.R_OK);
+      const secret = statSync(file);
+      if (!secret.isFile() || secret.uid !== process.getuid?.() || (secret.mode & 0o077)) throw new Error(`runAs: credential '${file}' must be daemon-owned 0600`);
+    }
     users.set(c.name, user);
   }
   // Private daemon data includes records, outbox, and all keys/bearers under it.

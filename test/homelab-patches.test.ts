@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { mcplHttp } from '../src/listeners.js';
+import { parseConfig } from '../src/config.js';
 import { test } from 'node:test';
 import { agentMcpFor, buildArgs, credentialEnv, denyRules, type ClaudeAgentSpec } from '../src/engines/claude.js';
 import { buildAgentLaunch } from '../src/users.js';
@@ -25,4 +28,31 @@ test('MCP profile gating and explicit credential deny rules', () => {
   assert.ok(buildArgs(spec).some((a) => a.startsWith('--allowedTools=') && a.includes('mcp__bosun__read')));
   assert.ok(!buildArgs({...spec, profile:'think'}).join(' ').includes('mcp__bosun__read'));
   assert.ok(denyRules('/state', spec.secretFiles).includes('Read(//secrets/a.oauth)'));
+});
+
+test('TCP transport exposes health/metrics but refuses dashboard content even with a forged identity', async () => {
+  const server = createServer(mcplHttp);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(server.address() as {port:number}).port}`;
+  try {
+    for (const route of ['/', '/api/runs', '/run/other', '/api/run/other/events']) {
+      const res = await fetch(url + route, {headers: {'Tailscale-User-Login':'misha'}});
+      assert.equal(res.status, 404);
+      assert.equal(await res.text(), 'not found\n');
+    }
+    assert.equal((await fetch(url + '/health')).status, 200);
+    assert.match(await (await fetch(url + '/metrics')).text(), /swarmbase_up 1/);
+  } finally { await new Promise<void>((r) => server.close(() => r())); }
+  assert.equal(parseConfig({dashboardSocket:'/run/private.sock'}).dashboardSocket, '/run/private.sock');
+  assert.throws(() => parseConfig({dashboardSocket:'relative'}), /absolute Unix socket/);
+});
+
+test('shared workspace gid and caller concurrency controls are explicit and validated', () => {
+  const caller = {name:'a', tokenSha256:'a'.repeat(64), apiKeyFile:'/secret', runAs:'swarm-a', cwdGid:22001, maxConcurrentAgents:2, perRunConcurrency:1};
+  const c = parseConfig({callers:[caller] as never}).callers[0];
+  assert.equal(c.cwdGid, 22001);
+  assert.equal(c.maxConcurrentAgents, 2);
+  assert.equal(c.perRunConcurrency, 1);
+  assert.throws(() => parseConfig({callers:[{...caller, runAs:undefined}] as never}), /cwdGid/);
+  assert.throws(() => parseConfig({callers:[{...caller, maxConcurrentAgents:0}] as never}), /positive integer/);
 });

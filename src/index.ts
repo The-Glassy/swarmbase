@@ -9,9 +9,10 @@
  */
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { DEFAULT_CONFIG_PATH, loadConfig, watchDashboardAccess } from './config.js';
+import { mcplHttp } from './listeners.js';
 import { createDashboard, requestUrl } from './dashboard.js';
 import { addPrices, ensureEmptyMcpConfig, initLiveGroups } from './engines/claude.js';
 import { bwrapAvailable } from './engines/codex.js';
@@ -61,7 +62,20 @@ async function main(): Promise<void> {
   const byHash = new Map(cfg.callers.map((c) => [c.tokenSha256, c]));
 
   const dashboardAccess = watchDashboardAccess(configPath, cfg.dashboard, log);
-  const http = createServer(createDashboard(cfg, store, runs, notifier, dashboardAccess));
+  const dashboard = createDashboard(cfg, store, runs, notifier, dashboardAccess);
+  const http = createServer(cfg.dashboardSocket ? mcplHttp : dashboard);
+  const privateDashboard = cfg.dashboardSocket ? createServer(dashboard) : null;
+  if (cfg.dashboardSocket && privateDashboard) {
+    if (existsSync(cfg.dashboardSocket)) {
+      if (!lstatSync(cfg.dashboardSocket).isSocket()) throw new Error('dashboardSocket exists and is not a socket');
+      unlinkSync(cfg.dashboardSocket);
+    }
+    await new Promise<void>((resolve, reject) => {
+      privateDashboard.once('error', reject);
+      privateDashboard.listen(cfg.dashboardSocket!, resolve);
+    });
+    chmodSync(cfg.dashboardSocket, 0o660);
+  }
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
   http.on('upgrade', (req, socket, head) => {
@@ -98,6 +112,7 @@ async function main(): Promise<void> {
     void meter?.stop();
     for (const c of wss.clients) c.terminate();
     http.close();
+    privateDashboard?.close();
     setTimeout(() => process.exit(0), 1500).unref();
   };
   process.on('SIGTERM', () => stop('SIGTERM'));

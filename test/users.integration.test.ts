@@ -29,7 +29,8 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         codex: { baseUrl: 'http://127.0.0.1:1', bin: '/usr/local/libexec/swarmbase-test-agent', sandbox: 'none' } } as never,
       callers: ['a', 'b'].map((name) => ({ name, tokenSha256: name.repeat(64), apiKeyFile: join(dataDir, `${name}.key`),
         runAs: `swarmbase-test-${name}`, engines: ['claude', 'codex'], maxProfile: 'write',
-        cwdRoots: [`/home/swarmbase-test-${name}/projects`] })) as never,
+        cwdGid: Number(execFileSync('getent', ['group', `swarmbase-test-${name}-workspace`], {encoding:'utf8'}).split(':')[2]),
+        cwdRoots: [`/home/swarmbase-test-${name}/projects`, `/srv/swarmbase-test-${name}/workspace`] })) as never,
     });
     const users = initializeCallerUsers(cfg);
     const store = new RunStore(dataDir, users);
@@ -53,7 +54,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         writeFileSync(publicKey, 'public-test-key', { mode: 0o644 });
         try {
           const bad = { ...cfg, callers: cfg.callers.map((c) => c.name === 'b' ? { ...c, apiKeyFile: publicKey } : c) };
-          assert.throws(() => initializeCallerUsers(bad), /can access.*swarmbase-public.*chmod 0600/);
+          assert.throws(() => initializeCallerUsers(bad), /can access.*swarmbase-public.*chmod 0600|credential.*daemon-owned 0600/);
           assert.throws(() => initializeCallerUsers({ ...cfg, callers: cfg.callers.map((c) => ({ ...c, runAs: 'swarmbase-test-no-such-user' })) }), /useradd|unknown user/);
           assert.throws(() => initializeCallerUsers({ ...cfg, userHelper: '/usr/local/libexec/no-such-swarmbase-helper' }), /install.*0755/);
           assert.throws(() => initializeCallerUsers({ ...cfg, userHelper: '/usr/bin/true' }), /NOPASSWD/);
@@ -75,6 +76,43 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         assert.equal(statSync(cwd).uid, uid);
         assert.equal(statSync(cwd).mode & 0o007, 0);
         assert.equal(existsSync(s.homeDir!), false, 'throwaway home removed as caller');
+      });
+
+      await t.test('shared tenant gid accepts a foreign-owned setgid workspace; artifacts inherit group rw', async () => {
+        const s = {...base(), cwd: '/srv/swarmbase-test-a/workspace'};
+        const outcome = await runClaudeAgent(s, new AbortController().signal, () => {});
+        assert.equal(outcome.ok, true, outcome.error ?? '');
+        const st = statSync(join(s.cwd, 'own.txt'));
+        assert.equal(st.gid, cfg.callers[0].cwdGid);
+        assert.equal(st.mode & 0o066, 0o060);
+        assert.equal(st.mode & 0o007, 0);
+      });
+      await t.test('OAuth/MCP and ChatGPT auth are private to caller; refresh survives home removal', async () => {
+        const authFile = join(dataDir, 'chat-auth.json');
+        const mcpFile = join(dataDir, 'browser.json');
+        writeFileSync(authFile, '{}', {mode: 0o600});
+        writeFileSync(mcpFile, '{"mcpServers":{}}', {mode: 0o600});
+        const s = {...base(), credential: {kind: 'authToken' as const, value: 'test-oauth'},
+          agentMcp: {configPath: mcpFile, allowedTools: ['mcp__bosun__read']}};
+        const claude = await runClaudeAgent(s, new AbortController().signal, () => {});
+        assert.equal(claude.ok, true, claude.error ?? '');
+        const c = JSON.parse(String(claude.result));
+        assert.equal(c.oauth, 'test-oauth');
+        assert.equal(c.apiKey, undefined);
+        assert.equal(c.mcpMode, 0o600);
+        assert.equal(c.homeMode, 0o700);
+        for (const sandbox of ['none', 'bwrap'] as const) {
+          const cs = base();
+          const out = await runCodexAgent({...cs, homeDir: cs.homeDir!, apiKey:'', codexAuthFile:authFile,
+            maxTokens:1000, baseUrl:null, codexBin:'/usr/local/libexec/swarmbase-test-agent', sandbox, extraRoBinds:[], denyExtra:[]},
+          null, new AbortController().signal, () => {});
+          assert.equal(out.ok, true, out.error ?? '');
+          assert.equal(out.billing, 'subscription');
+          assert.equal(out.costUsd, 0);
+          assert.equal(JSON.parse(String(out.result)).authMode, 0o600);
+          assert.equal(JSON.parse(readFileSync(authFile, 'utf8')).refreshed, true);
+          assert.equal(existsSync(cs.homeDir!), false);
+        }
       });
 
       for (const sandbox of ['none', 'bwrap'] as const) for (const profile of ['write', 'read', 'think'] as const) await t.test(`codex ${profile}, ${sandbox}: CLI and outer wrapper run as A`, async () => {

@@ -67,6 +67,10 @@ export interface CallerPolicy {
   runAs?: string;
   /** Per-caller workspace root; defaults to the Linux account's home. */
   homeDir?: string;
+  /** Explicit tenant workspace group; permits foreign-owned setgid cwdRoots. */
+  cwdGid?: number;
+  maxConcurrentAgents?: number;
+  perRunConcurrency?: number;
   /** Absolute path to a ChatGPT-login auth.json; overrides Codex gateway mode. */
   codexAuthFile?: string | null;
   engines: EngineName[];
@@ -131,6 +135,8 @@ export interface Config {
    *  (and all of a codex agent's spend: the Codex CLI reports tokens, not cost). */
   prices?: Record<string, { in: number; out: number; cacheRead: number; cacheWrite: number; cacheWrite1h: number }>;
   dashboard: DashboardAccess;
+  /** Private Unix listener; when set, TCP never serves dashboard routes. */
+  dashboardSocket?: string;
   callers: CallerPolicy[];
 }
 
@@ -220,6 +226,7 @@ export function resolveOnPath(name: string, pathEnv = process.env.PATH ?? ''): s
 }
 
 export function parseConfig(raw: Partial<Config>, pathEnv = process.env.PATH ?? ''): Config {
+  if (raw.dashboardSocket !== undefined && (typeof raw.dashboardSocket !== 'string' || !isAbsolute(raw.dashboardSocket))) throw new Error('config: dashboardSocket must be an absolute Unix socket path');
   const rawEngines = (raw.engines ?? {}) as Partial<Config['engines']>;
   const claude: ClaudeEngineConfig = {
     ...DEFAULTS.engines.claude,
@@ -278,6 +285,10 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
   if (c.homeDir !== undefined && (!c.runAs || typeof c.homeDir !== 'string' || !isAbsolute(c.homeDir))) {
     throw new Error(`config: caller ${c.name} homeDir requires runAs and an absolute path`);
   }
+  if (c.cwdGid !== undefined && (!c.runAs || !Number.isInteger(c.cwdGid) || c.cwdGid <= 0)) throw new Error(`config: caller ${c.name} cwdGid needs runAs and a positive gid`);
+  for (const field of ['maxConcurrentAgents', 'perRunConcurrency'] as const) {
+    if (c[field] !== undefined && (!Number.isInteger(c[field]) || c[field]! <= 0)) throw new Error(`config: caller ${c.name} ${field} must be a positive integer`);
+  }
   const maxProfile = c.maxProfile ?? 'read';
   if (!PROFILES.includes(maxProfile)) throw new Error(`config: caller ${c.name} bad maxProfile ${maxProfile}`);
   const engines = c.engines ?? ['claude'];
@@ -302,6 +313,9 @@ function validateCaller(c: Partial<CallerPolicy>): CallerPolicy {
     authTokenFile: c.authTokenFile ? expand(c.authTokenFile) : null,
     ...(c.runAs ? { runAs: c.runAs, ...(c.homeDir ? { homeDir: resolve(c.homeDir) } : {}) } : {}),
     codexAuthFile: c.codexAuthFile ?? null,
+    ...(c.cwdGid === undefined ? {} : { cwdGid: c.cwdGid }),
+    ...(c.maxConcurrentAgents === undefined ? {} : { maxConcurrentAgents: c.maxConcurrentAgents }),
+    ...(c.perRunConcurrency === undefined ? {} : { perRunConcurrency: c.perRunConcurrency }),
     engines,
     maxProfile,
     cwdRoots: (c.cwdRoots ?? []).map((r) => resolve(expand(r))),

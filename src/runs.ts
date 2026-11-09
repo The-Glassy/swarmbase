@@ -106,6 +106,7 @@ interface ResolvedAgent {
 export class RunManager {
   private active = new Map<string, ActiveRun>();
   private globalSem: Semaphore;
+  private callerSems = new Map<string, Semaphore>();
 
   constructor(
     private readonly cfg: Config,
@@ -116,6 +117,7 @@ export class RunManager {
     private readonly meter: UsageMeter | null = null,
   ) {
     this.globalSem = new Semaphore(cfg.maxConcurrentAgents);
+    for (const c of cfg.callers) this.callerSems.set(c.name, new Semaphore(c.maxConcurrentAgents ?? cfg.maxConcurrentAgents));
   }
 
   /** Compile-only syntax check (nothing executes), so `run` can refuse a broken script up front. */
@@ -171,7 +173,7 @@ export class RunManager {
       agents: new Map(),
       inflight: new Set(),
       cache: input.resumeFrom ? this.store.readJournal(input.resumeFrom) : new Map(),
-      runSem: new Semaphore(this.cfg.perRunConcurrency),
+      runSem: new Semaphore(input.caller.perRunConcurrency ?? this.cfg.perRunConcurrency),
       agentSeq: 0,
       reservedUsd: 0,
       reservedTokens: 0,
@@ -606,8 +608,15 @@ export class RunManager {
       endEarly(slot.ac.signal.aborted || run.ending ? 'run ended before start' : 'budget exhausted', !(slot.ac.signal.aborted || run.ending));
       return;
     }
-    try { await this.globalSem.acquire(slot.ac.signal); }
+    const callerSem = this.callerSems.get(run.caller.name)!;
+    let callerAcquired = false;
+    try {
+      await callerSem.acquire(slot.ac.signal);
+      callerAcquired = true;
+      await this.globalSem.acquire(slot.ac.signal);
+    }
     catch {
+      if (callerAcquired) callerSem.release();
       run.runSem.release();
       this.release(run, reserved, { usd: 0, tokens: 0 });
       endEarly('run ended before start', false);
@@ -682,6 +691,7 @@ export class RunManager {
       outcome = { ok: false, result: null, costUsd: 0, durationMs: 0, usage: null, error: (e as Error).message, reason: 'exit' };
     } finally {
       this.globalSem.release();
+      callerSem.release();
       run.runSem.release();
     }
 

@@ -46,6 +46,20 @@ if req.get('write', True):
 result = dict(uid=os.getuid(), keyError=denied(read_key), rootError=denied(touch_other),
               ownWrite=req.get('write', True), home=os.environ['HOME'], daemonSecret=os.environ.get('DAEMON_SECRET'),
               apiKey=os.environ.get('ANTHROPIC_API_KEY'))
+result['oauth'] = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')
+result['homeMode'] = os.stat(os.environ['HOME']).st_mode & 0o777
+for arg in sys.argv:
+    if arg.startswith('--mcp-config=') and arg.endswith('agent-mcp.json'):
+        result['mcpMode'] = os.stat(arg.split('=', 1)[1]).st_mode & 0o777
+if os.environ.get('CODEX_HOME'):
+    auth = os.path.join(os.environ['CODEX_HOME'], 'auth.json')
+    if os.path.exists(auth):
+        result['authMode'] = os.stat(auth).st_mode & 0o777
+        # Atomic CLI credential replacement works with private copies.
+        with open(auth + '.new', 'w') as f:
+            f.write('{"refreshed":true}')
+        os.chmod(auth + '.new', 0o600)
+        os.replace(auth + '.new', auth)
 result = {k: v for k, v in result.items() if v is not None}
 result['directoryFds'] = []
 import stat
