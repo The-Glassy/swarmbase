@@ -1,5 +1,24 @@
+import type { AgentMcp } from './config.js';
+
+/** What the guide says about the caller's agent MCP tools (agentMcp), if any. */
+function mcpToolsText(m: AgentMcp | null | undefined): string {
+  if (!m) return '';
+  const browser = m.allowedTools.filter((t) => t.startsWith('mcp__bosun__'));
+  const other = m.allowedTools.filter((t) => !t.startsWith('mcp__bosun__'));
+  const who = m.profiles.map((p) => `"${p}"`).join(' or ');
+  let s = '';
+  if (browser.length) {
+    s += `\n  - Agents with profile ${who} can also browse the web through the Bosun browser: ${browser.map((t) => `\`${t}\``).join(', ')}.
+    Ephemeral sessions only, wiped when the agent ends: no logins or saved profiles, no human handoff, and a small
+    session cap shared by all your agents. Tell the agent to session_open, navigate, read (a11y or text), and
+    session_close when done. Prefer WebFetch for plain pages; use the browser for pages that need JavaScript or clicks.`;
+  }
+  if (other.length) s += `\n  - Agents with profile ${who} also get these MCP tools:\n    ${other.map((t) => `\`${t}\``).join(', ')}.`;
+  return s;
+}
+
 /** The authoring reference handed to callers by the `guide` tool. */
-export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; tokensDefault: number; tokensMax: number; maxAgents: number; perRun: number; agentTimeoutMs: number | null; runTimeoutMs: number; cwdRoots: string[] }): string {
+export function guideText(opts: { defaultModel: string; engines: string[]; defaultModels: Record<string, string>; maxProfile: string; budgetDefault: number; budgetMax: number; tokensDefault: number; tokensMax: number; maxAgents: number; perRun: number; agentTimeoutMs: number | null; runTimeoutMs: number; cwdRoots: string[]; agentMcp?: AgentMcp | null }): string {
   const codex = opts.engines.includes('codex');
   return `# SwarmBase — writing a run
 
@@ -37,7 +56,7 @@ the top is optional; \`meta.name\` becomes the run label if you didn't give one.
   - \`profile\` — what the subagent may touch. think: no tools. read: Read/Grep/Glob inside its cwd only,
     plus WebFetch/WebSearch. write: + Edit/Write inside its cwd, and Bash. Default read; your maximum is
     "${opts.maxProfile}".${codex ? ` For engine "codex": think = no tools; read = a read-only shell with no network,
-    plus the CLI's web search; write = a shell that may write inside its cwd and has network (git, curl).` : ''}
+    plus the CLI's web search; write = a shell that may write inside its cwd and has network (git, curl).` : ''}${mcpToolsText(opts.agentMcp)}
   - \`cwd\` — absolute directory the subagent works in. Default: the run's own scratch dir, which is
     deleted when the run ends (start the run with \`keepWork: true\` to keep it; \`resume\` gets a fresh one).
     Allowed roots for you: ${opts.cwdRoots.length ? opts.cwdRoots.join(', ') : 'none (scratch dir only)'}.

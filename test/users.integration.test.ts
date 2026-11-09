@@ -41,7 +41,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
     let n = 0;
     const base = (): ClaudeAgentSpec => ({ runId: meta.id, n: ++n, label: 'probe', prompt: probe, schema: null, model: 'fake',
       effort: null, profile: 'write', cwd, timeoutMs: 10_000, maxBudgetUsd: null, streamPath: store.agentStreamPath(meta, n),
-      credential: { kind: 'apiKey', value: 'test-key-a' }, secretFiles: [], apiBaseUrl: null, claudeBin: '/usr/local/libexec/swarmbase-test-agent',
+      credential: { kind: 'apiKey', value: 'test-key-a' }, secretFiles: [], agentMcp: null, apiBaseUrl: null, claudeBin: '/usr/local/libexec/swarmbase-test-agent',
       emptyMcpConfigPath: '/never-read-daemon-mcp', dataDir, callerUser: user, homeDir: store.agentHomeDir(meta, n) });
     const meter = new UsageMeter();
     await meter.start();

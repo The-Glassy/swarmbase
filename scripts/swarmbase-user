@@ -36,12 +36,12 @@ def prepare(files):
     home = files['home']
     # Never reuse state that an earlier agent could have planted.
     os.makedirs(os.path.dirname(home), mode=0o750, exist_ok=True)
-    os.mkdir(home, 0o750)
+    os.mkdir(home, 0o700)
     os.mkdir(os.path.join(home, 'tmp'), 0o750)
     for name, contents in files['files'].items():
         if '/' in name or name in ('.', '..'):
             raise ValueError('invalid home file name')
-        fd = os.open(os.path.join(home, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
+        fd = os.open(os.path.join(home, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w') as f:
             f.write(contents)
 

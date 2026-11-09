@@ -139,6 +139,7 @@ export class SwarmTools implements ToolHost {
           agentTimeoutMs: this.cfg.agentTimeoutMs,
           runTimeoutMs: this.cfg.runTimeoutMs,
           cwdRoots: caller.cwdRoots,
+          agentMcp: caller.agentMcp,
         }));
         default: return text(`Unknown tool: ${name}`, true);
       }

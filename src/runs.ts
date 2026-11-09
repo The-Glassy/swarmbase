@@ -20,7 +20,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { isUnder, profileRank, type CallerPolicy, type Config, type EngineName, type Profile } from './config.js';
-import { killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome, KILL_GRACE_MS } from './engines/claude.js';
+import { agentMcpFor, killAllAgentGroups, runClaudeAgent, readApiKey, type Activity, type AgentOutcome, KILL_GRACE_MS } from './engines/claude.js';
 import { runCodexAgent, strictSchemaProblem } from './engines/codex.js';
 import type { UsageMeter } from './meter.js';
 import { Semaphore } from './semaphore.js';
@@ -641,6 +641,10 @@ export class RunManager {
       const credFiles = this.cfg.callers.flatMap((c) => [c.apiKeyFile, c.authTokenFile]).filter((f): f is string => !!f);
       const credReal = credFiles.map(safeRealpath).filter((p): p is string => !!p);
       const secretFiles = [...new Set([...credFiles, ...credReal])];
+      // Every caller's agent MCP config (it holds that caller's MCP credentials), as configured and resolved.
+      const mcpPaths = this.cfg.callers.flatMap((c) => (c.agentMcp ? [c.agentMcp.configPath] : []));
+      const mcpReal = mcpPaths.map(safeRealpath).filter((p): p is string => !!p);
+      const mcpConfigs = [...mcpPaths, ...mcpReal];
       if (a.engine === 'codex') {
         const codex = this.cfg.engines.codex;
         if (reserved.tokens < a.maxTokens) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: maxTokens ${a.maxTokens} cut to ${reserved.tokens}, what is left of the run's token budget` });
@@ -653,7 +657,7 @@ export class RunManager {
           codexBin: codex.bin,
           sandbox: codex.sandbox,
           extraRoBinds: codex.extraRoBinds,
-          denyExtra: [...new Set(credReal), this.cfg.configPath].filter((p): p is string => !!p),
+          denyExtra: [...new Set(credReal), this.cfg.configPath, ...mcpReal].filter((p): p is string => !!p),
         }, this.meter!, slot.ac.signal, onActivity);
         if (o.unpriced) this.store.emit(meta.id, { type: 'log', message: `[swarmbase] agent ${n}: no price row for ${a.model}; ${o.tokens} tokens charged as $0 against the USD budget (set config.prices to shadow-price it); the run's token budget bounds it` });
         spentTokens = o.tokens;
@@ -667,7 +671,8 @@ export class RunManager {
           apiBaseUrl: this.cfg.engines.claude.baseUrl,
           claudeBin: this.cfg.engines.claude.bin,
           emptyMcpConfigPath: this.emptyMcpConfigPath,
-          secretFiles,
+          agentMcp: agentMcpFor(run.caller.agentMcp, a.profile),
+          secretFiles: [...new Set([...secretFiles, ...mcpConfigs])],
           homeDir: this.store.userContext(meta) ? this.store.agentHomeDir(meta, n) : undefined,
         }, slot.ac.signal, onActivity);
       }
