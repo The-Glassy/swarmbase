@@ -132,6 +132,14 @@ export function denyPaths(dataDir: string, homeDir: string, extra: string[] = []
   ])].filter((p) => !ancestorOfRoot(p));
 }
 
+/** A runAs caller cannot read the daemon's data dir or home at all (Unix permissions), and the
+ *  CLI's glob scan fails hard on an unreadable directory ("rg: /var/lib/swarmbase: Permission
+ *  denied"). Keep only entries outside them: the caller's own home and its workspace. */
+export function callerDenyPaths(paths: string[], dataDir: string): string[] {
+  const roots = [dataDir.replace(/\/+$/, ''), homedir().replace(/\/+$/, '')];
+  return paths.filter((p) => !roots.some((r) => p === r || p.startsWith(r + '/')));
+}
+
 const RUN_RECORDS = ['meta.json', 'events.jsonl', 'journal.jsonl', 'script.js', 'args.json', 'result.json'];
 
 /**
@@ -217,8 +225,9 @@ export function strictSchemaProblem(schema: unknown): string | null {
 export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bearer: string } | null = null): string {
   if (spec.codexAuthFile) meter = null; // caller login always takes precedence
   // Only add the auth alias when present; gateway homes have no auth.json.
-  const deny = denyPaths(spec.dataDir, spec.homeDir, [...spec.denyExtra,
-    ...(spec.codexAuthFile ? [join(spec.homeDir, 'auth.json')] : [])], spec.cwd).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
+  const allDeny = denyPaths(spec.dataDir, spec.homeDir, [...spec.denyExtra,
+    ...(spec.codexAuthFile ? [join(spec.homeDir, 'auth.json')] : [])], spec.cwd);
+  const deny = (spec.callerUser ? callerDenyPaths(allDeny, spec.dataDir) : allDeny).map((p) => `${tomlStr(p)} = "deny"`).join('\n');
   const lines = [
     `model = ${tomlStr(spec.model)}`,
     ...(meter ? ['model_provider = "swarmbase"'] : ['cli_auth_credentials_store = "file"']),
