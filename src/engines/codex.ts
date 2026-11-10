@@ -137,7 +137,9 @@ export function denyPaths(dataDir: string, homeDir: string, extra: string[] = []
  *  denied"). Keep only entries outside them: the caller's own home and its workspace. */
 export function callerDenyPaths(paths: string[], dataDir: string): string[] {
   const roots = [dataDir.replace(/\/+$/, ''), homedir().replace(/\/+$/, '')];
-  return paths.filter((p) => !roots.some((r) => p === r || p.startsWith(r + '/')));
+  // config.toml holds no secret without a meter (subscription mode), and Codex's inner bwrap
+  // fails to mask that file ("Can't write data to file .../config.toml: Bad file descriptor").
+  return paths.filter((p) => !roots.some((r) => p === r || p.startsWith(r + '/')) && !p.endsWith('/config.toml'));
 }
 
 const RUN_RECORDS = ['meta.json', 'events.jsonl', 'journal.jsonl', 'script.js', 'args.json', 'result.json'];
