@@ -117,6 +117,7 @@ export class SwarmTools implements ToolHost {
 
   async callTool(caller: CallerPolicy, name: string, args: Record<string, unknown>): Promise<ToolResult> {
     try {
+      if (name === 'run' || name === 'resume') this.runs.assertAdmissionOpen();
       switch (name) {
         case 'run': return this.startRun(caller, args, null);
         case 'resume': return this.resume(caller, args);

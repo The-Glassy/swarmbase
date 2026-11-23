@@ -82,14 +82,19 @@ def private_tmp(work_dir, root, display):
                 raise ValueError('guest X11 socket directory must be root-owned and protected')
     unshare_mounts()
     with ExitStack() as cleanup:
-        work = os.open(work_dir, DIR_FLAGS)
+        run_dir = os.path.dirname(work_dir)
+        run = os.open(run_dir, DIR_FLAGS)
+        cleanup.callback(os.close, run)
+        actual = os.readlink('/proc/self/fd/%d' % run)
+        if actual != run_dir or not actual.startswith(root.rstrip('/') + '/') or os.fstat(run).st_uid != os.getuid():
+            raise ValueError('run directory must be caller-owned and inside its home root')
+        work = os.open(os.path.basename(work_dir), DIR_FLAGS, dir_fd=run)
         cleanup.callback(os.close, work)
-        actual = os.readlink('/proc/self/fd/%d' % work)
-        if actual != work_dir or not actual.startswith(root.rstrip('/') + '/') or os.fstat(work).st_uid != os.getuid():
+        if os.fstat(work).st_uid != os.getuid():
             raise ValueError('run work directory must be caller-owned and inside its home root')
-        tmp = scratch_dir(work, 'tmp')
+        tmp = scratch_dir(run, 'tmp')
         cleanup.callback(os.close, tmp)
-        var_tmp = scratch_dir(work, 'var-tmp')
+        var_tmp = scratch_dir(run, 'var-tmp')
         cleanup.callback(os.close, var_tmp)
         x11 = None
         if guest_x11:
@@ -140,7 +145,7 @@ def remove_entry(parent, name):
         os.close(fd)
 
 
-def remove(path, recreate=False):
+def remove(path, recreate=False, siblings=()):
     parts = path.split('/')
     if parts[0] != '' or any(p in ('', '.', '..') for p in parts[1:]):
         raise ValueError('cleanup requires a canonical absolute path')
@@ -157,14 +162,16 @@ def remove(path, recreate=False):
             return False
         if os.readlink('/proc/self/fd/%d' % parent) != os.path.dirname(path):
             raise ValueError('cleanup parent moved: ' + path)
-        try:
-            remove_entry(parent, parts[-1])
-        except FileNotFoundError:
-            if not recreate:
-                return False
+        removed = False
+        for name in (*siblings, parts[-1]):
+            try:
+                remove_entry(parent, name)
+                removed = True
+            except FileNotFoundError:
+                pass
         if recreate:
             os.mkdir(parts[-1], 0o750, dir_fd=parent)
-        return True
+        return removed or recreate
     finally:
         os.close(parent)
 
@@ -332,6 +339,10 @@ def main():
         print('true')
     elif op == 'remove':
         print(json.dumps(remove(req['path'], req.get('recreate', False))))
+    elif op == 'removeWork':
+        if os.path.basename(req['path']) != 'work':
+            raise ValueError('expected a run work directory')
+        print(json.dumps(remove(req['path'], recreate=True, siblings=('tmp', 'var-tmp'))))
     elif op == 'launch':
         return launch(req, initial_control)
     else:

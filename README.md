@@ -197,9 +197,10 @@ directories. The helper checks ownership and allowed roots again when starting t
 fd. Keep ownership, modes and group/ACL assignments private after startup. A write caller can deliberately share its
 own files.
 
-Put caller homes on disk. Each launch gets a private mount namespace with the run's `work/tmp` at `/tmp`
-and `work/var-tmp` at `/var/tmp`, even with an explicit cwd in a tenant workspace. `TMPDIR` points to
-`/tmp`. Sibling agents in a run share the two backing directories. Each caller is one trust domain. Runs
+Put caller homes on disk. Each launch gets a private mount namespace with the run's `tmp` at `/tmp`
+and `var-tmp` at `/var/tmp`, even with an explicit cwd in a tenant workspace. These directories sit next
+to `work`, so the default cwd starts empty. `TMPDIR` points to `/tmp`. Sibling agents in a run share the
+two backing directories. Each caller is one trust domain. Runs
 for that caller share a Unix UID, home, and workspace, and can access each other's scratch through its
 backing path. Different runs get separate literal temp paths. Different callers are isolated by their Unix
 accounts and home permissions. Work cleanup removes scratch when the run ends, subject to `keepWork`
@@ -360,6 +361,15 @@ allowlist blocks DNS rebinding.
 - Restart: stops every in-flight subagent. Runs are marked `interrupted` on the next boot, callers are notified, and `resume` replays finished agents for free. If the daemon died uncleanly, leftover agent process groups (claude and codex) are reaped on boot and interrupted runs' throwaway `CODEX_HOME`s are deleted.
 - Tests: `npm test` (the codex engine suite runs its live cases when a Codex CLI is found — `CODEX_BIN` or the usual
   install paths — else skips them). `node test/runner-harness.mjs` exercises the runner sandbox. `node test/client.mjs <caller> <tool> '<json>' [--wait]` is a minimal MCPL host.
+
+### Draining before maintenance
+
+When `dashboardSocket` is configured, the daemon creates an owner-only admin socket with `.admin`
+appended to that path. Use `POST /api/drain` there to reject new `run` and `resume` calls with a
+retryable maintenance error, including on connections already open. Existing runs can finish.
+Poll `GET /api/health` on either private socket until `draining` is true and `activeRuns`,
+`agentsRunning`, and `agentsQueued` are all zero. Send `DELETE /api/drain` on the admin socket to
+release the drain if maintenance is aborted. Each daemon start opens admission.
 
 ## Known limits
 

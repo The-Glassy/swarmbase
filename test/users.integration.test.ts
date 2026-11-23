@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.js';
@@ -41,6 +41,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
     const uid = Number(execFileSync('id', ['-u', user.user], { encoding: 'utf8' }).trim());
     const meta = store.create({ caller: 'a', label: null, script: '', args: null, defaults: {}, budgetUsd: 1, budgetTokens: 1, resumedFrom: null });
     const cwd = store.workDir(meta);
+    const runDir = dirname(cwd);
     const probe = JSON.stringify({ action: 'probe', otherKey: join(dataDir, 'b.key'), otherRoot: '/home/swarmbase-test-b/projects' });
     let n = 0;
     const base = (): ClaudeAgentSpec => ({ runId: meta.id, n: ++n, label: 'probe', prompt: probe, schema: null, model: 'fake',
@@ -52,6 +53,19 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
     const saved = process.env.DAEMON_SECRET;
     process.env.DAEMON_SECRET = 'B-TOKEN-MUST-NOT-LEAK';
     try {
+      await t.test('the default work directory starts empty and accepts git clone into dot', async () => {
+        const fixture = spawnAgent('/bin/sh', ['-ec',
+          'git init --bare /tmp/source.git && git clone /tmp/source.git . && test -d .git && touch /var/tmp/clone-ok'],
+        cwd, { PATH: '/usr/bin:/bin', HOME: user.root }, '', user, { workDir: cwd });
+        let stderr = '';
+        fixture.stderr.on('data', (b) => { stderr += b; });
+        assert.equal((await once(fixture, 'close'))[0], 0, stderr);
+        assert.ok(existsSync(join(cwd, '.git')));
+        const paths = [join(runDir, 'tmp', 'source.git'), join(runDir, 'var-tmp', 'clone-ok')];
+        assert.ok(userOperation(user, { op: 'check', paths }).paths.every((p: { read: boolean }) => p.read));
+        store.deleteWork(meta);
+      });
+
       await t.test('startup checks use real caller accounts and reject accessible cross-caller paths', () => {
         const publicKey = join('/tmp', `swarmbase-public-${meta.id}.key`);
         writeFileSync(publicKey, 'public-test-key', { mode: 0o644 });
@@ -98,7 +112,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         const other = start('b');
         const guestFile = `guest-${meta.id}`;
         const marker = `run-${meta.id}`;
-        const absMarker = join(cwd, 'tmp', marker);
+        const absMarker = join(runDir, 'tmp', marker);
         const request = { ...JSON.parse(probe), scratch: marker, guestFile, otherScratch: absMarker };
         writeFileSync(join('/tmp', guestFile), 'guest-only', { mode: 0o644 });
         try {
@@ -112,7 +126,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
           assert.equal(first.guestFile, false);
           assert.equal(first.existingScratch, false);
           const check = (paths: string[]) => userOperation(user, { op: 'check', paths }).paths;
-          assert.ok(check([absMarker, absMarker + '.nested', join(cwd, 'var-tmp', marker)]).every((p: any) => p.read));
+          assert.ok(check([absMarker, absMarker + '.nested', join(runDir, 'var-tmp', marker)]).every((p: any) => p.read));
           assert.equal(existsSync(join('/tmp', marker)), false);
           assert.equal(existsSync(join('/var/tmp', marker)), false);
           for (const sandbox of ['none', 'bwrap'] as const) {
@@ -191,7 +205,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
               child.once('close', resolve);
             });
             assert.equal(code, 0, stderr);
-            const paths = [join(cwd, 'tmp', 'real-codex'), join(cwd, 'var-tmp', 'real-codex')];
+            const paths = [join(runDir, 'tmp', 'real-codex'), join(runDir, 'var-tmp', 'real-codex')];
             assert.ok(userOperation(user, { op: 'check', paths }).paths.every((p: any) => p.read));
           } finally {
             userOperation(user, { op: 'remove', path: s.homeDir });
@@ -286,11 +300,11 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
           try {
             await done;
             assert.equal(run.status, 'completed', run.error ?? '');
-            const work = store.workDir(run);
-            const paths = [join(work, 'tmp', 'cache', 'file'), join(work, 'var-tmp', 'cache', 'file')];
+            const runDir = dirname(store.workDir(run));
+            const paths = [join(runDir, 'tmp', 'cache', 'file'), join(runDir, 'var-tmp', 'cache', 'file')];
             const checks = userOperation(user, { op: 'check', paths }).paths;
             assert.deepEqual(checks.map((p: any) => p.read), [keepWork, keepWork]);
-            if (!keepWork) assert.deepEqual(userOperation(user, { op: 'check', paths: [join(work, 'tmp'), join(work, 'var-tmp')] }).paths
+            if (!keepWork) assert.deepEqual(userOperation(user, { op: 'check', paths: [join(runDir, 'tmp'), join(runDir, 'var-tmp')] }).paths
               .map((p: any) => p.directory), [false, false]);
           } finally {
             manager.shutdown();
@@ -317,7 +331,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
           let fixtureErrors = '';
           fixture.stderr.on('data', (b) => { fixtureErrors += b; });
           assert.equal((await once(fixture, 'close'))[0], 0, fixtureErrors);
-          const paths = [join(work, 'tmp', 'cache', 'file'), join(work, 'var-tmp', 'cache', 'file'), join(home, 'fixture')];
+          const paths = [join(dirname(work), 'tmp', 'cache', 'file'), join(dirname(work), 'var-tmp', 'cache', 'file'), join(home, 'fixture')];
           const canRead = () => userOperation(user, { op: 'check', paths }).paths.map((p: { read: boolean }) => p.read);
           assert.deepEqual(canRead(), [true, true, true]);
 

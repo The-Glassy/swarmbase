@@ -140,11 +140,19 @@ export class RunManager {
     return this.active.has(runId);
   }
 
-  stats(): { activeRuns: number; agentsRunning: number; agentsQueued: number } {
-    return { activeRuns: this.active.size, agentsRunning: this.globalSem.active, agentsQueued: this.globalSem.queued };
+  // Process-local so a restart always opens admission again.
+  draining = false;
+
+  stats(): { draining: boolean; activeRuns: number; agentsRunning: number; agentsQueued: number } {
+    return { draining: this.draining, activeRuns: this.active.size, agentsRunning: this.globalSem.active, agentsQueued: this.globalSem.queued };
+  }
+
+  assertAdmissionOpen(): void {
+    if (this.draining) throw new Error('Swarmbase is draining for maintenance. Retry after maintenance.');
   }
 
   start(input: StartRunInput): RunMeta {
+    this.assertAdmissionOpen();
     const meta = this.store.create({
       caller: input.caller.name,
       label: input.label,
