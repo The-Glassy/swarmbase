@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { parseConfig } from '../src/config.js';
 import { ensureEmptyMcpConfig, runClaudeAgent, type ClaudeAgentSpec } from '../src/engines/claude.js';
-import { runCodexAgent } from '../src/engines/codex.js';
+import { renderConfig, runCodexAgent, type CodexAgentSpec } from '../src/engines/codex.js';
 import { UsageMeter } from '../src/meter.js';
 import { RunManager } from '../src/runs.js';
 import { RunStore } from '../src/store.js';
@@ -43,7 +43,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
     const base = (): ClaudeAgentSpec => ({ runId: meta.id, n: ++n, label: 'probe', prompt: probe, schema: null, model: 'fake',
       effort: null, profile: 'write', cwd, timeoutMs: 10_000, maxBudgetUsd: null, streamPath: store.agentStreamPath(meta, n),
       credential: { kind: 'apiKey', value: 'test-key-a' }, secretFiles: [], agentMcp: null, apiBaseUrl: null, claudeBin: '/usr/local/libexec/swarmbase-test-agent',
-      emptyMcpConfigPath: '/never-read-daemon-mcp', dataDir, callerUser: user, homeDir: store.agentHomeDir(meta, n) });
+      emptyMcpConfigPath: '/never-read-daemon-mcp', dataDir, callerUser: user, homeDir: store.agentHomeDir(meta, n), workDir: cwd });
     const meter = new UsageMeter();
     await meter.start();
     const saved = process.env.DAEMON_SECRET;
@@ -87,6 +87,61 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         assert.equal(st.mode & 0o066, 0o060);
         assert.equal(st.mode & 0o007, 0);
       });
+
+      await t.test('absolute temp paths and sockets are backed by run work across engines and isolated by run and caller', async () => {
+        const start = (caller: string) => store.create({ caller, label: null, script: '', args: null,
+          defaults: {}, budgetUsd: 1, budgetTokens: 1, resumedFrom: null });
+        const same = start('a');
+        const other = start('b');
+        const guestFile = `guest-${meta.id}`;
+        const marker = `run-${meta.id}`;
+        const absMarker = join(cwd, 'tmp', marker);
+        const request = { ...JSON.parse(probe), scratch: marker, guestFile, otherScratch: absMarker };
+        writeFileSync(join('/tmp', guestFile), 'guest-only', { mode: 0o644 });
+        try {
+          const s = { ...base(), cwd: '/srv/swarmbase-test-a/workspace', prompt: JSON.stringify({ ...request, nested: true }) };
+          const claude = await runClaudeAgent(s, new AbortController().signal, () => {});
+          assert.equal(claude.ok, true, claude.error ?? '');
+          const first = JSON.parse(String(claude.result));
+          assert.equal(first.tmpEnv, '/tmp');
+          assert.equal(first.tmpDevice, statSync(cwd).dev);
+          assert.equal(first.varTmpDevice, statSync(cwd).dev);
+          assert.equal(first.guestFile, false);
+          assert.equal(first.existingScratch, false);
+          const check = (paths: string[]) => userOperation(user, { op: 'check', paths }).paths;
+          assert.ok(check([absMarker, absMarker + '.nested', join(cwd, 'var-tmp', marker)]).every((p: any) => p.read));
+          assert.equal(existsSync(join('/tmp', marker)), false);
+          assert.equal(existsSync(join('/var/tmp', marker)), false);
+          for (const sandbox of ['none', 'bwrap'] as const) {
+            const cs = base();
+            const codex = await runCodexAgent({ ...cs, homeDir: cs.homeDir!, apiKey: 'test-key-a', maxTokens: 1000,
+              baseUrl: 'http://127.0.0.1:1', codexBin: '/usr/local/libexec/swarmbase-test-agent', sandbox,
+              extraRoBinds: [], denyExtra: [], prompt: JSON.stringify(request) }, meter, new AbortController().signal, () => {});
+            assert.equal(codex.ok, true, codex.error ?? '');
+            const r = JSON.parse(String(codex.result));
+            assert.equal(r.tmpInode, first.tmpInode);
+            assert.equal(r.varTmpInode, first.varTmpInode);
+            assert.equal(r.existingScratch, true);
+            assert.equal(r.tmpEnv, '/tmp');
+          }
+          for (const run of [same, other]) {
+            const work = store.workDir(run);
+            const outcome = await runClaudeAgent({ ...base(), cwd: work, workDir: work, callerUser: store.userContext(run),
+              homeDir: store.agentHomeDir(run, n), prompt: JSON.stringify(request) }, new AbortController().signal, () => {});
+            assert.equal(outcome.ok, true, outcome.error ?? '');
+            const r = JSON.parse(String(outcome.result));
+            assert.equal(r.existingScratch, false);
+            assert.notEqual(r.tmpInode, first.tmpInode);
+            if (run === other) assert.equal(r.otherScratch, 13);
+          }
+        } finally {
+          for (const run of [same, other]) {
+            const owner = store.userContext(run)!;
+            userOperation(owner, { op: 'remove', path: join(owner.root, '.swarmbase', run.id) });
+          }
+          rmSync(join('/tmp', guestFile), { force: true });
+        }
+      });
       await t.test('OAuth/MCP and ChatGPT auth are private to caller; refresh survives home removal', async () => {
         const authFile = join(dataDir, 'chat-auth.json');
         const mcpFile = join(dataDir, 'browser.json');
@@ -114,6 +169,31 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
           assert.equal(existsSync(cs.homeDir!), false);
         }
       });
+
+      const realCodex = process.env.CODEX_BIN;
+      await t.test('the real Codex inner write sandbox uses both private mounts with a tenant workspace cwd',
+        { skip: !realCodex && 'set CODEX_BIN to the installed Codex CLI' }, async () => {
+          const cs = base();
+          const s: CodexAgentSpec = { ...cs, cwd: '/srv/swarmbase-test-a/workspace', codexBin: realCodex!, homeDir: cs.homeDir!,
+            maxTokens: 1000, apiKey: '', baseUrl: null, sandbox: 'none', extraRoBinds: [], denyExtra: [] };
+          const args = ['sandbox', '-P', 'swarm-write', '--', '/bin/sh', '-ec', 'touch /tmp/real-codex /var/tmp/real-codex'];
+          const child = spawnAgent(realCodex!, args, s.cwd, {
+            PATH: '/usr/local/bin:/usr/bin:/bin', HOME: s.homeDir, CODEX_HOME: s.homeDir, TMPDIR: '/tmp',
+          }, '', user, { workDir: cwd, files: { home: s.homeDir, files: { 'config.toml': renderConfig(s) } } });
+          let stderr = '';
+          child.stderr.on('data', (b) => { stderr += b; });
+          try {
+            const code = await new Promise<number | null>((resolve, reject) => {
+              child.once('error', reject);
+              child.once('close', resolve);
+            });
+            assert.equal(code, 0, stderr);
+            const paths = [join(cwd, 'tmp', 'real-codex'), join(cwd, 'var-tmp', 'real-codex')];
+            assert.ok(userOperation(user, { op: 'check', paths }).paths.every((p: any) => p.read));
+          } finally {
+            userOperation(user, { op: 'remove', path: s.homeDir });
+          }
+        });
 
       for (const sandbox of ['none', 'bwrap'] as const) for (const profile of ['write', 'read', 'think'] as const) await t.test(`codex ${profile}, ${sandbox}: CLI and outer wrapper run as A`, async () => {
         const s = base();
@@ -155,7 +235,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
           userOperation(user, { op: 'remove', path: join(cwd, p) });
         }
         const child = spawnAgent('/usr/local/libexec/swarmbase-test-agent', [], cwd,
-          { PATH: '/usr/bin:/bin', HOME: user.root }, '{"action":"hold"}', user);
+          { PATH: '/usr/bin:/bin', HOME: user.root }, '{"action":"hold"}', user, { workDir: cwd });
         let stderr = '';
         child.stderr.on('data', (b) => { stderr += b; });
         const closed = new Promise<void>((resolve, reject) => {
@@ -189,6 +269,30 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         } finally {
           manager.shutdown();
           userOperation(user, { op: 'remove', path: join(user.root, '.swarmbase', run.id) });
+        }
+      });
+
+      await t.test('run completion deletes both temp dirs unless keepWork is set', async () => {
+        for (const keepWork of [false, true]) {
+          let ended!: () => void;
+          const done = new Promise<void>((resolve) => { ended = resolve; });
+          const manager = new RunManager(cfg, store, ensureEmptyMcpConfig(dataDir), { runEnded: () => ended() }, meter);
+          const request = { ...JSON.parse(probe), scratch: 'work-cleanup', guestFile: 'absent', otherScratch: '/absent' };
+          const run = manager.start({ caller: cfg.callers[0], script: `return await agent(${JSON.stringify(JSON.stringify(request))}, {profile:'write'});`,
+            args: null, label: 'tmp-cleanup', defaults: {}, budgetUsd: 1, budgetTokens: 1_000_000, resumeFrom: null, keepWork });
+          try {
+            await done;
+            assert.equal(run.status, 'completed', run.error ?? '');
+            const work = store.workDir(run);
+            const paths = [join(work, 'tmp', 'work-cleanup'), join(work, 'var-tmp', 'work-cleanup')];
+            const checks = userOperation(user, { op: 'check', paths }).paths;
+            assert.deepEqual(checks.map((p: any) => p.read), [keepWork, keepWork]);
+            if (!keepWork) assert.deepEqual(userOperation(user, { op: 'check', paths: [join(work, 'tmp'), join(work, 'var-tmp')] }).paths
+              .map((p: any) => p.directory), [false, false]);
+          } finally {
+            manager.shutdown();
+            userOperation(user, { op: 'remove', path: join(user.root, '.swarmbase', run.id) });
+          }
         }
       });
 

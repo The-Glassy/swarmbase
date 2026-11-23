@@ -11,7 +11,8 @@ test('OAuth is exclusive and caller secrets go through helper stdin, never sudo 
   assert.deepEqual(credentialEnv({kind: 'apiKey', value: 'private-key'}), { ANTHROPIC_API_KEY: 'private-key' });
   const launch = buildAgentLaunch('/usr/bin/claude', ['-p'], '/srv/a/work', credentialEnv({kind: 'authToken', value: 'private-oauth'}), 'prompt',
     {user: 'swarm-a', root: '/home/swarm-a', helper: '/usr/local/libexec/swarmbase-user'},
-    {home: '/home/swarm-a/run-home', files: {'agent-mcp.json': 'private-mcp', 'auth.json': 'private-codex'}});
+    {workDir: '/home/swarm-a/work', files: {home: '/home/swarm-a/run-home',
+      files: {'agent-mcp.json': 'private-mcp', 'auth.json': 'private-codex'}}});
   assert.doesNotMatch(JSON.stringify([launch.args, launch.env]), /private-/);
   assert.match(launch.input, /private-oauth/);
   assert.match(launch.input, /private-mcp/);

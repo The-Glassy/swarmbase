@@ -643,6 +643,7 @@ export class RunManager {
         cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved.usd, streamPath: this.store.agentStreamPath(meta, n),
         dataDir: realpathSync(this.cfg.dataDir),
         callerUser: this.store.userContext(meta),
+        workDir: this.store.workDir(meta),
       };
       // Every caller's API key and subscription token files: no agent may read its own
       // caller's credentials or another's. Claude's rules are strings (configured and resolved

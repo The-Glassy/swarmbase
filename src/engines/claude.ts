@@ -34,7 +34,7 @@ import { createWriteStream, readFileSync, writeFileSync, existsSync } from 'node
 import { join } from 'node:path';
 import type { AgentMcp, Profile } from '../config.js';
 import { looksLikeCodexAgent } from './codex.js';
-import { signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
+import { isolatedTempEnv, signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
 
 export interface ClaudeAgentSpec {
   runId: string;
@@ -61,6 +61,7 @@ export interface ClaudeAgentSpec {
   secretFiles: string[];
   callerUser?: CallerUser;
   homeDir?: string;
+  workDir?: string;
 }
 
 export interface AgentOutcome {
@@ -291,23 +292,24 @@ export function runClaudeAgent(spec: ClaudeAgentSpec, signal: AbortSignal, onAct
   }
   env.DISABLE_AUTOUPDATER = '1';
 
-  let files;
+  let isolated;
   if (spec.callerUser) {
-    if (!spec.homeDir) throw new Error('isolated claude requires a throwaway home');
+    if (!spec.homeDir || !spec.workDir) throw new Error('isolated claude requires a throwaway home and run work directory');
     env.HOME = spec.homeDir;
-    env.TMPDIR = join(spec.homeDir, 'tmp');
+    Object.assign(env, isolatedTempEnv());
     env.USER = env.LOGNAME = spec.callerUser.user;
     env.SHELL = '/bin/sh';
     env.PATH = '/usr/local/bin:/usr/bin:/bin';
     delete env.LC_ALL;
-    files = { home: spec.homeDir, files: { 'empty-mcp.json': '{"mcpServers":{}}',
+    const files = { home: spec.homeDir, files: { 'empty-mcp.json': '{"mcpServers":{}}',
       ...(spec.agentMcp && spec.profile !== 'think' ? { 'agent-mcp.json': readFileSync(spec.agentMcp.configPath, 'utf8') } : {}) } };
+    isolated = { workDir: spec.workDir, files };
   }
 
   const out = createWriteStream(spec.streamPath, { flags: 'a' });
   const args = buildArgs(spec.callerUser ? { ...spec, emptyMcpConfigPath: join(spec.homeDir!, 'empty-mcp.json'),
     agentMcp: spec.agentMcp ? { ...spec.agentMcp, configPath: join(spec.homeDir!, 'agent-mcp.json') } : null } : spec);
-  const child = spawnAgent(spec.claudeBin, args, spec.cwd, env, spec.prompt, spec.callerUser, files);
+  const child = spawnAgent(spec.claudeBin, args, spec.cwd, env, spec.prompt, spec.callerUser, isolated);
 
   if (child.pid !== undefined) trackAgentGroup(child.pid, spec.callerUser ? (sig) => signalAgent(child, sig) : undefined);
   let resultEvent: Record<string, unknown> | null = null;

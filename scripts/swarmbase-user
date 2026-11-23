@@ -5,6 +5,7 @@ One JSON request on stdin, followed (for launch) by TERM/KILL control lines.
 No daemon environment or credentials in argv. No privileged filesystem work.
 """
 import ctypes
+from contextlib import ExitStack
 import json
 import os
 import pwd
@@ -15,6 +16,100 @@ import stat
 import subprocess
 import sys
 import time
+
+
+LIBC = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNS = 0x00020000
+MS_RDONLY, MS_NOSUID, MS_NODEV, MS_REMOUNT = 1, 2, 4, 32
+MS_BIND, MS_REC, MS_PRIVATE = 4096, 16384, 262144
+DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def checked(result, action):
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, '%s: %s' % (action, os.strerror(error)))
+
+
+def mount(source, target, flags):
+    checked(LIBC.mount(os.fsencode(source) if source else None, os.fsencode(target),
+                       None, flags, None), ('remount ' if flags & MS_REMOUNT else 'mount ') + target)
+
+
+def unshare_mounts():
+    uid, gid = os.getuid(), os.getgid()
+    # Keep the real uid/gid numbers and the credentials for supplementary
+    # workspace groups. Mount authority exists only in the new user namespace.
+    checked(LIBC.unshare(CLONE_NEWUSER), 'create private /tmp user namespace')
+    for name, value in [('uid_map', f'{uid} {uid} 1'), ('setgroups', 'deny'), ('gid_map', f'{gid} {gid} 1')]:
+        with open('/proc/self/' + name, 'w') as f:
+            f.write(value)
+    checked(LIBC.unshare(CLONE_NEWNS), 'create private /tmp mount namespace')
+    mount(None, '/', MS_REC | MS_PRIVATE)
+
+
+def bind_dir(fd, target, flags=0):
+    mount('/proc/self/fd/%d' % fd, target, MS_BIND)
+    mount(None, target, MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NODEV | flags)
+
+
+def scratch_dir(work, name, private=True):
+    try:
+        os.mkdir(name, 0o700, dir_fd=work)
+    except FileExistsError:
+        pass  # Other agents of the same run use this directory too.
+    fd = os.open(name, DIR_FLAGS, dir_fd=work)
+    st = os.fstat(fd)
+    if st.st_uid != os.getuid() or (private and st.st_mode & 0o777 != 0o700):
+        os.close(fd)
+        raise ValueError('unsafe ownership or permissions on run scratch directory: ' + name)
+    return fd
+
+
+def private_tmp(work_dir, root, display):
+    x11_path = '/tmp/.X11-unix'
+    guest_x11 = None
+    # A daemon configured with a local DISPLAY can use the guest's X server.
+    # Otherwise, leave /tmp/.X11-unix available for run-local Xvfb.
+    if display.startswith((':', 'unix:')):
+        try:
+            guest_x11 = os.lstat(x11_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if (not stat.S_ISDIR(guest_x11.st_mode) or guest_x11.st_uid != 0
+                    or (guest_x11.st_mode & 0o022 and not guest_x11.st_mode & stat.S_ISVTX)):
+                raise ValueError('guest X11 socket directory must be root-owned and protected')
+    unshare_mounts()
+    with ExitStack() as cleanup:
+        work = os.open(work_dir, DIR_FLAGS)
+        cleanup.callback(os.close, work)
+        actual = os.readlink('/proc/self/fd/%d' % work)
+        if actual != work_dir or not actual.startswith(root.rstrip('/') + '/') or os.fstat(work).st_uid != os.getuid():
+            raise ValueError('run work directory must be caller-owned and inside its home root')
+        tmp = scratch_dir(work, 'tmp')
+        cleanup.callback(os.close, tmp)
+        var_tmp = scratch_dir(work, 'var-tmp')
+        cleanup.callback(os.close, var_tmp)
+        x11 = None
+        if guest_x11:
+            x11 = os.open(x11_path, DIR_FLAGS)
+            cleanup.callback(os.close, x11)
+            st = os.fstat(x11)
+            if (st.st_dev, st.st_ino) != (guest_x11.st_dev, guest_x11.st_ino):
+                raise ValueError('guest X11 socket directory changed during launch')
+            # Xvfb may have made this directory sticky and world-writable.
+            # Its parent is still accessible only to the caller.
+            os.close(scratch_dir(tmp, '.X11-unix', private=False))
+        bind_dir(tmp, '/tmp')
+        bind_dir(var_tmp, '/var/tmp')
+        if x11 is not None:
+            bind_dir(x11, '/tmp/.X11-unix', MS_RDONLY)
+        # Linux capability ABI v3: header (version, pid), two data words
+        # (effective, permitted, inheritable). No namespace caps past setup.
+        header = (ctypes.c_uint32 * 2)(0x20080522, 0)
+        checked(LIBC.capset(header, (ctypes.c_uint32 * 6)()), 'drop mount capabilities')
 
 
 def remove(path):
@@ -37,7 +132,6 @@ def prepare(files):
     # Never reuse state that an earlier agent could have planted.
     os.makedirs(os.path.dirname(home), mode=0o750, exist_ok=True)
     os.mkdir(home, 0o700)
-    os.mkdir(os.path.join(home, 'tmp'), 0o750)
     for name, contents in files['files'].items():
         if '/' in name or name in ('.', '..'):
             raise ValueError('invalid home file name')
@@ -76,9 +170,9 @@ def reap_descendants():
 
 def launch(req, initial_control):
     # Linux PR_SET_CHILD_SUBREAPER, before any child is forked.
-    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+    if LIBC.prctl(36, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
-    if ctypes.CDLL(None, use_errno=True).prctl(38, 1, 0, 0, 0) != 0:
+    if LIBC.prctl(38, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), 'PR_SET_NO_NEW_PRIVS')
     prepare(req.get('files'))
     os.umask(0o007)
@@ -96,6 +190,7 @@ def launch(req, initial_control):
         env = {k: str(v) for k, v in req['env'].items() if v is not None}
         account = pwd.getpwuid(os.getuid())
         env.update(USER=account.pw_name, LOGNAME=account.pw_name, SHELL='/bin/sh')
+        private_tmp(req['workDir'], req['roots'][0], env.get('DISPLAY', ''))
         pinned = '__SWARMBASE_PINNED_CWD__'
         args = [str(cwd_fd) if a == pinned else a for a in req['args']]
         # bwrap mounts the fd's directory, then chdirs inside its new mount
@@ -172,7 +267,12 @@ def main():
                 bwrap_fd = '--bind-fd' in help_text and '--ro-bind-fd' in help_text
             except (OSError, subprocess.SubprocessError):
                 pass
-        print(json.dumps(dict(uid=os.getuid(), gid=os.getgid(), home=pwd.getpwuid(os.getuid()).pw_dir, groups=os.getgroups(), paths=paths, bwrapFd=bwrap_fd)))
+        info = dict(uid=os.getuid(), gid=os.getgid(), home=pwd.getpwuid(os.getuid()).pw_dir,
+                    groups=os.getgroups(), paths=paths, bwrapFd=bwrap_fd)
+        if req.get('privateTmp'):
+            unshare_mounts()
+            info['privateTmp'] = True
+        print(json.dumps(info))
     elif op == 'readAuth':
         fd = os.open(req['path'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd) as f:

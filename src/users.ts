@@ -7,12 +7,18 @@ import type { Config } from './config.js';
 
 export interface CallerUser { user: string; root: string; helper: string; cwdRoots?: string[]; cwdGid?: number }
 export interface UserFiles { home: string; files: Record<string, string> }
+interface UserLaunch { workDir: string; files?: UserFiles }
 export const HELPER_ENV = { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' };
 /** Replaced by the helper with a validated directory fd, consumed by bwrap. */
 export const PINNED_CWD = '__SWARMBASE_PINNED_CWD__';
 
 export function helperCommand(user: CallerUser): { command: string; args: string[] } {
   return { command: '/usr/bin/sudo', args: ['-n', '-u', user.user, '--', user.helper] };
+}
+
+export function isolatedTempEnv(): Record<string, string> {
+  const { DISPLAY, XAUTHORITY } = process.env;
+  return { TMPDIR: '/tmp', ...(DISPLAY ? { DISPLAY } : {}), ...(DISPLAY && XAUTHORITY ? { XAUTHORITY } : {}) };
 }
 
 export interface AgentLaunch {
@@ -22,10 +28,12 @@ export interface AgentLaunch {
 
 /** Pure argument builder; tests can inspect the privilege boundary without sudo. */
 export function buildAgentLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv,
-  prompt: string, user?: CallerUser, files?: UserFiles): AgentLaunch {
+  prompt: string, user?: CallerUser, isolated?: UserLaunch): AgentLaunch {
   if (!user) return { command, args, cwd, env, input: prompt, keepOpen: false };
+  if (!isolated?.workDir) throw new Error('runAs agent requires the run work directory');
+  const { workDir, files } = isolated;
   return { ...helperCommand(user), cwd: '/', env: HELPER_ENV, keepOpen: true,
-    input: JSON.stringify({ op: 'launch', command, args, cwd, env, prompt, files, roots: [user.root, ...(user.cwdRoots ?? [])], cwdGid: user.cwdGid }) + '\n' };
+    input: JSON.stringify({ op: 'launch', command, args, cwd, env, prompt, workDir, files, roots: [user.root, ...(user.cwdRoots ?? [])], cwdGid: user.cwdGid }) + '\n' };
 }
 
 export function assertNoCallerAccess(user: CallerUser, entries: { path: string; read: boolean; write: boolean; execute: boolean; directory: boolean }[]): void {
@@ -108,11 +116,12 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
     const provisional = { user: c.runAs!, root: c.homeDir ?? '/', helper: cfg.userHelper };
     // sudo resolves the account; the check request also proves the exact rule works.
     const needsBwrap = c.engines.includes('codex') && cfg.engines.codex.sandbox === 'bwrap';
-    const info = operation(provisional, { op: 'check', paths: [], bwrap: needsBwrap });
-    if (needsBwrap && !info.bwrapFd) throw new Error(`runAs: ${c.runAs} needs bubblewrap with --bind-fd and --ro-bind-fd; install a current bubblewrap package (0.10+ or a distro backport), or configure engines.codex.sandbox as "none" for write-trusted callers`);
+    const info = operation(provisional, { op: 'check', paths: [], bwrap: needsBwrap, privateTmp: true });
     if (!Number.isInteger(info.uid) || !info.uid || info.uid === process.getuid?.() || uids.has(info.uid)) {
       throw new Error(`runAs: ${c.name} needs a distinct non-root uid, different from the daemon and every other caller`);
     }
+    if (!info.privateTmp) throw new Error(`runAs: update ${cfg.userHelper} to the helper that supports private run temp directories`);
+    if (needsBwrap && !info.bwrapFd) throw new Error(`runAs: ${c.runAs} needs bubblewrap with --bind-fd and --ro-bind-fd; install a current bubblewrap package (0.10+ or a distro backport), or configure engines.codex.sandbox as "none" for write-trusted callers`);
     uids.add(info.uid);
     c.homeDir ??= info.home;
     const user = { ...provisional, cwdGid: c.cwdGid, root: realpathSync(c.homeDir!), cwdRoots: c.cwdRoots.map((r) => realpathSync(r)) };
@@ -164,8 +173,8 @@ export function initializeCallerUsers(cfg: Config, operation = userOperation): M
 const controls = new WeakMap<ChildProcessWithoutNullStreams, boolean>();
 
 export function spawnAgent(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv,
-  prompt: string, user?: CallerUser, files?: UserFiles, spawnProcess: typeof spawn = spawn): ChildProcessWithoutNullStreams {
-  const plan = buildAgentLaunch(command, args, cwd, env, prompt, user, files);
+  prompt: string, user?: CallerUser, isolated?: UserLaunch, spawnProcess: typeof spawn = spawn): ChildProcessWithoutNullStreams {
+  const plan = buildAgentLaunch(command, args, cwd, env, prompt, user, isolated);
   // The daemon cannot use a caller-owned cwd at spawn time; sudo must start in
   // a daemon-controlled directory and the helper chdirs after changing identity.
   const child = spawnProcess(plan.command, plan.args, { cwd: plan.cwd, env: plan.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });

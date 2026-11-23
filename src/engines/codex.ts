@@ -57,7 +57,7 @@ import type { Profile } from '../config.js';
 import { estimateCost, KILL_GRACE_MS, priceFor, trackAgentGroup, untrackAgentGroup, type Activity, type AgentOutcome } from './claude.js';
 import type { Usage, UsageMeter } from '../meter.js';
 import { Semaphore } from '../semaphore.js';
-import { PINNED_CWD, signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
+import { isolatedTempEnv, PINNED_CWD, signalAgent, spawnAgent, userOperation, type CallerUser } from '../users.js';
 
 export interface CodexAgentSpec {
   runId: string;
@@ -90,6 +90,7 @@ export interface CodexAgentSpec {
    *  the daemon's config file): denied by path. */
   denyExtra: string[];
   callerUser?: CallerUser;
+  workDir?: string;
 }
 
 export interface CodexOutcome extends AgentOutcome {
@@ -283,6 +284,7 @@ export function renderConfig(spec: CodexAgentSpec, meter: { baseUrl: string; bea
     '[permissions.swarm-write.filesystem]',
     'glob_scan_max_depth = 8',
     '":workspace_roots" = "write"',
+    ...(spec.callerUser ? ['"/var/tmp" = "write"'] : []),
     deny,
     '[permissions.swarm-write.network]',
     'enabled = true',
@@ -345,7 +347,9 @@ export function bwrapArgs(spec: CodexAgentSpec, env: Record<string, string>): st
   for (const f of ['/etc/resolv.conf', '/etc/hosts', '/etc/nsswitch.conf', '/etc/passwd', '/etc/group', '/etc/localtime', '/etc/ssl', '/etc/ca-certificates', '/etc/pki', '/etc/ld.so.cache', '/etc/ld.so.conf', '/etc/ld.so.conf.d', '/etc/alternatives', '/etc/gai.conf', '/etc/protocols', '/etc/services']) {
     args.push(...roBindTry(f));
   }
-  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp');
+  args.push('--proc', '/proc', '--dev', '/dev');
+  if (spec.callerUser) args.push('--bind', '/tmp', '/tmp', '--bind', '/var/tmp', '/var/tmp');
+  else args.push('--tmpfs', '/tmp');
   for (const d of binMounts([spec.codexBin, process.execPath])) args.push(...roBindTry(d));
   for (const p of spec.extraRoBinds) args.push(...roBindTry(p));
   args.push('--bind', spec.homeDir, spec.homeDir);
@@ -374,6 +378,7 @@ function priceable(u: Usage): Record<string, number> {
 function runCodexAgentUnlocked(spec: CodexAgentSpec, meter: UsageMeter | null, signal: AbortSignal, onActivity: (a: Activity) => void): Promise<CodexOutcome> {
   const subscription = !!spec.codexAuthFile;
   if (!subscription && (!meter || !spec.baseUrl)) throw new Error('Codex gateway mode needs a meter and baseUrl');
+  if (spec.callerUser && !spec.workDir) throw new Error('isolated codex requires the run work directory');
   const started = Date.now();
   if (!spec.callerUser) mkdirSync(join(spec.homeDir, 'tmp'), { recursive: true, mode: 0o700 });
   const schemaPath = spec.schema ? join(spec.homeDir, 'schema.json') : null;
@@ -432,6 +437,7 @@ function runCodexAgentUnlocked(spec: CodexAgentSpec, meter: UsageMeter | null, s
     LANG: process.env.LANG ?? 'C.UTF-8',
     TERM: 'dumb',
     NO_COLOR: '1',
+    ...(spec.callerUser ? isolatedTempEnv() : {}),
   };
   const codexArgs = buildArgs(spec, schemaPath);
   const [cmd, args] = spec.sandbox === 'bwrap'
@@ -444,7 +450,8 @@ function runCodexAgentUnlocked(spec: CodexAgentSpec, meter: UsageMeter | null, s
     ...(spec.codexAuthFile ? { 'auth.json': readFileSync(spec.codexAuthFile, 'utf8') } : {}),
     ...(schemaPath ? { 'schema.json': JSON.stringify(strictSchema(spec.schema)) } : {}),
   } } : undefined;
-  const child = spawnAgent(cmd, args, spec.cwd, env, spec.prompt, spec.callerUser, files);
+  const child = spawnAgent(cmd, args, spec.cwd, env, spec.prompt, spec.callerUser,
+    spec.callerUser ? { workDir: spec.workDir!, files } : undefined);
   if (child.pid !== undefined) trackAgentGroup(child.pid, spec.callerUser ? (sig) => signalAgent(child, sig) : undefined);
 
   let lastText = '';
