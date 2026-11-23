@@ -72,6 +72,14 @@ if 'scratch' in req:
     if req.get('nested'):
         subprocess.run(['/usr/bin/bwrap', '--dev-bind', '/', '/', '--proc', '/proc', '--',
                         '/bin/sh', '-ec', 'touch "/tmp/$1.nested"', 'sh', marker], check=True)
+    if req.get('readOnlyScratch'):
+        for root in ('/tmp', '/var/tmp'):
+            cache = os.path.join(root, 'cache')
+            os.mkdir(cache)
+            with open(os.path.join(cache, 'file'), 'w') as f:
+                f.write('read-only fixture')
+            for path in (os.path.join(cache, 'file'), cache, root):
+                os.chmod(path, 0o555)
 for arg in sys.argv:
     if arg.startswith('--mcp-config=') and arg.endswith('agent-mcp.json'):
         result['mcpMode'] = os.stat(arg.split('=', 1)[1]).st_mode & 0o777

@@ -1,9 +1,11 @@
 /** Real kernel checks. See scripts/setup-test-users.sh; never uses paid APIs. */
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.js';
 import { ensureEmptyMcpConfig, runClaudeAgent, type ClaudeAgentSpec } from '../src/engines/claude.js';
 import { renderConfig, runCodexAgent, type CodexAgentSpec } from '../src/engines/codex.js';
@@ -22,16 +24,17 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
     const dataDir = mkdtempSync('/home/swarmbase-test-daemon/state/integration-');
     for (const name of ['a', 'b']) writeFileSync(join(dataDir, `${name}.key`), `test-key-${name}`, { mode: 0o600 });
     const configPath = join(dataDir, 'config.json');
-    writeFileSync(configPath, '{}', { mode: 0o600 });
-    const cfg = parseConfig({
-      dataDir, configPath,
+    const rawConfig = {
+      dataDir, port: 0,
       engines: { claude: { bin: '/usr/local/libexec/swarmbase-test-agent' },
         codex: { baseUrl: 'http://127.0.0.1:1', bin: '/usr/local/libexec/swarmbase-test-agent', sandbox: 'none' } } as never,
       callers: ['a', 'b'].map((name) => ({ name, tokenSha256: name.repeat(64), apiKeyFile: join(dataDir, `${name}.key`),
         runAs: `swarmbase-test-${name}`, engines: ['claude', 'codex'], maxProfile: 'write',
         cwdGid: Number(execFileSync('getent', ['group', `swarmbase-test-${name}-workspace`], {encoding:'utf8'}).split(':')[2]),
         cwdRoots: [`/home/swarmbase-test-${name}/projects`, `/srv/swarmbase-test-${name}/workspace`] })) as never,
-    });
+    };
+    writeFileSync(configPath, JSON.stringify(rawConfig), { mode: 0o600 });
+    const cfg = parseConfig({ ...rawConfig, configPath });
     const users = initializeCallerUsers(cfg);
     const store = new RunStore(dataDir, users);
     const user = users.get('a')!;
@@ -88,7 +91,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         assert.equal(st.mode & 0o007, 0);
       });
 
-      await t.test('absolute temp paths and sockets are backed by run work across engines and isolated by run and caller', async () => {
+      await t.test('absolute temp paths and sockets are separate per run, with caller-owned backing paths', async () => {
         const start = (caller: string) => store.create({ caller, label: null, script: '', args: null,
           defaults: {}, budgetUsd: 1, budgetTokens: 1, resumedFrom: null });
         const same = start('a');
@@ -132,7 +135,7 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
             const r = JSON.parse(String(outcome.result));
             assert.equal(r.existingScratch, false);
             assert.notEqual(r.tmpInode, first.tmpInode);
-            if (run === other) assert.equal(r.otherScratch, 13);
+            assert.equal(r.otherScratch, run === other ? 13 : undefined);
           }
         } finally {
           for (const run of [same, other]) {
@@ -272,19 +275,19 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
         }
       });
 
-      await t.test('run completion deletes both temp dirs unless keepWork is set', async () => {
+      await t.test('run completion deletes both 0555 temp trees unless keepWork is set', async () => {
         for (const keepWork of [false, true]) {
           let ended!: () => void;
           const done = new Promise<void>((resolve) => { ended = resolve; });
           const manager = new RunManager(cfg, store, ensureEmptyMcpConfig(dataDir), { runEnded: () => ended() }, meter);
-          const request = { ...JSON.parse(probe), scratch: 'work-cleanup', guestFile: 'absent', otherScratch: '/absent' };
+          const request = { ...JSON.parse(probe), scratch: 'work-cleanup', guestFile: 'absent', otherScratch: '/absent', readOnlyScratch: true };
           const run = manager.start({ caller: cfg.callers[0], script: `return await agent(${JSON.stringify(JSON.stringify(request))}, {profile:'write'});`,
             args: null, label: 'tmp-cleanup', defaults: {}, budgetUsd: 1, budgetTokens: 1_000_000, resumeFrom: null, keepWork });
           try {
             await done;
             assert.equal(run.status, 'completed', run.error ?? '');
             const work = store.workDir(run);
-            const paths = [join(work, 'tmp', 'work-cleanup'), join(work, 'var-tmp', 'work-cleanup')];
+            const paths = [join(work, 'tmp', 'cache', 'file'), join(work, 'var-tmp', 'cache', 'file')];
             const checks = userOperation(user, { op: 'check', paths }).paths;
             assert.deepEqual(checks.map((p: any) => p.read), [keepWork, keepWork]);
             if (!keepWork) assert.deepEqual(userOperation(user, { op: 'check', paths: [join(work, 'tmp'), join(work, 'var-tmp')] }).paths
@@ -294,6 +297,64 @@ test('real caller users: both engines/profiles, EACCES boundaries, ownership, cl
             userOperation(user, { op: 'remove', path: join(user.root, '.swarmbase', run.id) });
           }
         }
+      });
+
+      await t.test('restart sweeps 0555 caller scratch and homes after an interrupted run', async () => {
+        const create = () => store.create({ caller: 'a', label: null, script: '', args: null, defaults: {},
+          budgetUsd: 1, budgetTokens: 1, resumedFrom: null });
+        const orphan = create();
+        const broken = create();
+        const brokenDir = join(user.root, '.swarmbase', broken.id);
+        broken.callerRoot = '/no-longer-configured';
+        store.saveMeta(broken);
+        orphan.agentsTotal = 1;
+        store.saveMeta(orphan);
+        const work = store.workDir(orphan);
+        const home = store.agentHomeDir(orphan, 1);
+        try {
+          const fixture = spawnAgent('/bin/sh', ['-ec', 'mkdir /tmp/cache /var/tmp/cache; touch /tmp/cache/file /var/tmp/cache/file; chmod -R 0555 /tmp /var/tmp "$HOME"'],
+            work, { PATH: '/usr/bin:/bin', HOME: home }, '', user, { workDir: work, files: { home, files: { fixture: 'orphan home' } } });
+          let fixtureErrors = '';
+          fixture.stderr.on('data', (b) => { fixtureErrors += b; });
+          assert.equal((await once(fixture, 'close'))[0], 0, fixtureErrors);
+          const paths = [join(work, 'tmp', 'cache', 'file'), join(work, 'var-tmp', 'cache', 'file'), join(home, 'fixture')];
+          const canRead = () => userOperation(user, { op: 'check', paths }).paths.map((p: { read: boolean }) => p.read);
+          assert.deepEqual(canRead(), [true, true, true]);
+
+          // Leave the durable records in the state a killed daemon leaves behind.
+          const daemon = spawn(process.execPath, [fileURLToPath(new URL('../src/index.js', import.meta.url))], {
+            env: { ...process.env, SWARMBASE_CONFIG: configPath }, stdio: ['ignore', 'ignore', 'pipe'],
+          });
+          const exited = once(daemon, 'exit');
+          let logs = '';
+          daemon.stderr.on('data', (b) => { logs += b; });
+          try {
+            for (let i = 0; i < 300 && !logs.includes('listening on') && daemon.exitCode === null; i++) await delay(20);
+            assert.match(logs, /listening on/);
+            assert.match(logs, new RegExp(`run ${broken.id} orphan agent home cleanup failed`));
+            const reloaded = new RunStore(dataDir, users);
+            assert.equal(reloaded.get(orphan.id)?.status, 'interrupted');
+            assert.equal(reloaded.get(broken.id)?.status, 'interrupted');
+            assert.deepEqual(canRead(), [false, false, false]);
+            assert.equal(statSync(work).uid, uid);
+          } finally {
+            daemon.kill();
+            await exited;
+          }
+        } finally {
+          userOperation(user, { op: 'remove', path: join(user.root, '.swarmbase', orphan.id) });
+          userOperation(user, { op: 'remove', path: brokenDir });
+        }
+      });
+
+      await t.test('cleanup refuses a redirected ancestor and unlinks an entry symlink', async () => {
+        const fixture = spawnAgent('/bin/sh', ['-ec', 'mkdir -p target/work; touch target/work/sentinel; ln -s target redirect; ln -s target/work link'],
+          cwd, { PATH: '/usr/bin:/bin', HOME: user.root }, '', user, { workDir: cwd });
+        assert.equal((await once(fixture, 'close'))[0], 0);
+        assert.throws(() => userOperation(user, { op: 'remove', path: join(cwd, 'redirect', 'work'), recreate: true }), /Not a directory/);
+        assert.equal(userOperation(user, { op: 'remove', path: join(cwd, 'link'), recreate: true }), true);
+        assert.equal(statSync(join(cwd, 'link')).isDirectory(), true);
+        assert.equal(existsSync(join(cwd, 'target', 'work', 'sentinel')), true);
       });
 
       await t.test('launch refuses a caller-owned directory outside configured roots', async () => {

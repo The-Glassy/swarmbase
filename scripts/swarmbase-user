@@ -10,7 +10,6 @@ import json
 import os
 import pwd
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -112,17 +111,62 @@ def private_tmp(work_dir, root, display):
         checked(LIBC.capset(header, (ctypes.c_uint32 * 6)()), 'drop mount capabilities')
 
 
-def remove(path):
-    if os.path.islink(path) or not os.path.isdir(path):
-        if os.path.lexists(path):
-            os.unlink(path)
+def remove_entry(parent, name):
+    st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        os.unlink(name, dir_fd=parent)
         return
+    fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+    try:
+        opened = os.fstat(fd)
+        identity = (opened.st_dev, opened.st_ino)
+        if identity != (st.st_dev, st.st_ino) or opened.st_uid != os.getuid():
+            raise ValueError('cleanup directory changed or is not caller-owned: ' + name)
+        # Unlink needs write permission on the directory, and listing needs
+        # read permission. An O_PATH fd can pin the directory even at mode 000.
+        pinned = '/proc/self/fd/%d' % fd
+        if opened.st_mode & 0o700 != 0o700:
+            os.chmod(pinned, stat.S_IMODE(opened.st_mode) | 0o700)
+        for child in os.listdir(pinned):
+            try:
+                remove_entry(fd, child)
+            except FileNotFoundError:
+                pass
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if identity != (current.st_dev, current.st_ino):
+            raise ValueError('cleanup directory moved: ' + name)
+        os.rmdir(name, dir_fd=parent)
+    finally:
+        os.close(fd)
 
-    def writable(fn, p, exc):
-        if not os.path.islink(p):
-            os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) | 0o700)
-            fn(p)
-    shutil.rmtree(path, onerror=writable)
+
+def remove(path, recreate=False):
+    parts = path.split('/')
+    if parts[0] != '' or any(p in ('', '.', '..') for p in parts[1:]):
+        raise ValueError('cleanup requires a canonical absolute path')
+    # Open every ancestor without following symlinks. Keep the final parent
+    # pinned for both removal and recreation, even if its pathname changes.
+    parent = os.open('/', DIR_FLAGS)
+    try:
+        try:
+            for part in parts[1:-1]:
+                child = os.open(part, DIR_FLAGS, dir_fd=parent)
+                os.close(parent)
+                parent = child
+        except FileNotFoundError:
+            return False
+        if os.readlink('/proc/self/fd/%d' % parent) != os.path.dirname(path):
+            raise ValueError('cleanup parent moved: ' + path)
+        try:
+            remove_entry(parent, parts[-1])
+        except FileNotFoundError:
+            if not recreate:
+                return False
+        if recreate:
+            os.mkdir(parts[-1], 0o750, dir_fd=parent)
+        return True
+    finally:
+        os.close(parent)
 
 
 def prepare(files):
@@ -287,10 +331,7 @@ def main():
         os.makedirs(req['path'], mode=0o750, exist_ok=True)
         print('true')
     elif op == 'remove':
-        remove(req['path'])
-        if req.get('recreate'):
-            os.mkdir(req['path'], 0o750)
-        print('true')
+        print(json.dumps(remove(req['path'], req.get('recreate', False))))
     elif op == 'launch':
         return launch(req, initial_control)
     else:

@@ -271,7 +271,7 @@ export class RunManager {
       meta.counts.queued = 0;
       this.store.saveMeta(meta);
       this.store.emit(meta.id, { type: 'run_end', status: 'interrupted', spentUsd: meta.spentUsd, spentTokens: meta.spentTokens, error: meta.error });
-      this.store.sweepAgentHomes(meta); // codex homes its agents never got to delete
+      this.store.sweepAgentHomes(meta, (e) => console.error(`[swarmbase] run ${meta.id} orphan agent home cleanup failed:`, e));
       out.push(meta);
     }
     return out;

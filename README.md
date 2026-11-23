@@ -199,13 +199,19 @@ own files.
 
 Put caller homes on disk. Each launch gets a private mount namespace with the run's `work/tmp` at `/tmp`
 and `work/var-tmp` at `/var/tmp`, even with an explicit cwd in a tenant workspace. `TMPDIR` points to
-`/tmp`. Sibling agents in a run share the two backing directories. Work cleanup removes them when the run ends,
-subject to `keepWork` and `deleteWorkOnEnd`. The launcher needs unprivileged user and mount namespaces and
-checks for namespace support at startup. Update the daemon and helper together.
+`/tmp`. Sibling agents in a run share the two backing directories. Each caller is one trust domain. Runs
+for that caller share a Unix UID, home, and workspace, and can access each other's scratch through its
+backing path. Different runs get separate literal temp paths. Different callers are isolated by their Unix
+accounts and home permissions. Work cleanup removes scratch when the run ends, subject to `keepWork`
+and `deleteWorkOnEnd`. The launcher needs unprivileged user and mount namespaces and checks for
+namespace support at startup. Update the daemon and helper together.
 
 Tools can create Unix sockets in the run's `/tmp`, including a run-local Xvfb. For tools using a guest X server,
 set `DISPLAY` in the daemon environment. A local display exposes the guest's root-owned `/tmp/.X11-unix`
-read-only. An explicit `XAUTHORITY` path is passed through and must be readable by the caller.
+read-only. The read-only bind still allows connections to the shared X server. An explicit `XAUTHORITY`
+path is passed through and must be readable by the caller. Linux abstract Unix sockets remain visible in
+the guest network namespace, so Xvfb instances can contend for display numbers across runs and callers.
+Use distinct display numbers and X authentication for concurrent headed runs.
 Protected path checks include symlink targets and writable ancestors, to prevent replacement of an otherwise private
 config or key. The helper also sets Linux `no_new_privs` before launching an agent, preventing setuid/file-capability
 elevation; bubblewrap therefore requires working unprivileged user namespaces rather than a setuid fallback.

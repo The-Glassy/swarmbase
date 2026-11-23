@@ -297,15 +297,19 @@ export class RunStore {
 
   /** Delete the throwaway homes a crashed daemon left behind (an engine deletes
    *  its own when the agent ends). Returns how many went. */
-  sweepAgentHomes(meta: RunMeta): number {
-    const user = this.userContext(meta);
+  sweepAgentHomes(meta: RunMeta, onError: (error: unknown) => void): number {
+    let user: CallerUser | undefined;
+    try { user = this.userContext(meta); } catch (e) { onError(e); return 0; }
     if (user) {
       let n = 0;
       // Agent count is recorded by the daemon; never enumerate caller paths and
       // then delete them with daemon authority.
       for (let i = 1; i <= meta.agentsTotal; i++) {
-        userOperation(user, { op: 'remove', path: this.agentHomeDir(meta, i) });
-        n++;
+        try {
+          if (userOperation(user, { op: 'remove', path: agentHome(user, meta.id, i) })) n++;
+        } catch (e) {
+          onError(e);
+        }
       }
       return n;
     }
