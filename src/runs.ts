@@ -140,11 +140,19 @@ export class RunManager {
     return this.active.has(runId);
   }
 
-  stats(): { activeRuns: number; agentsRunning: number; agentsQueued: number } {
-    return { activeRuns: this.active.size, agentsRunning: this.globalSem.active, agentsQueued: this.globalSem.queued };
+  // Process-local so a restart always opens admission again.
+  draining = false;
+
+  stats(): { draining: boolean; activeRuns: number; agentsRunning: number; agentsQueued: number } {
+    return { draining: this.draining, activeRuns: this.active.size, agentsRunning: this.globalSem.active, agentsQueued: this.globalSem.queued };
+  }
+
+  assertAdmissionOpen(): void {
+    if (this.draining) throw new Error('Swarmbase is draining for maintenance. Retry after maintenance.');
   }
 
   start(input: StartRunInput): RunMeta {
+    this.assertAdmissionOpen();
     const meta = this.store.create({
       caller: input.caller.name,
       label: input.label,
@@ -271,7 +279,7 @@ export class RunManager {
       meta.counts.queued = 0;
       this.store.saveMeta(meta);
       this.store.emit(meta.id, { type: 'run_end', status: 'interrupted', spentUsd: meta.spentUsd, spentTokens: meta.spentTokens, error: meta.error });
-      this.store.sweepAgentHomes(meta); // codex homes its agents never got to delete
+      this.store.sweepAgentHomes(meta, (e) => console.error(`[swarmbase] run ${meta.id} orphan agent home cleanup failed:`, e));
       out.push(meta);
     }
     return out;
@@ -643,6 +651,7 @@ export class RunManager {
         cwd: a.cwd, timeoutMs: a.timeoutMs, maxBudgetUsd: reserved.usd, streamPath: this.store.agentStreamPath(meta, n),
         dataDir: realpathSync(this.cfg.dataDir),
         callerUser: this.store.userContext(meta),
+        workDir: this.store.workDir(meta),
       };
       // Every caller's API key and subscription token files: no agent may read its own
       // caller's credentials or another's. Claude's rules are strings (configured and resolved

@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -48,6 +49,37 @@ result = dict(uid=os.getuid(), keyError=denied(read_key), rootError=denied(touch
               apiKey=os.environ.get('ANTHROPIC_API_KEY'))
 result['oauth'] = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')
 result['homeMode'] = os.stat(os.environ['HOME']).st_mode & 0o777
+if 'scratch' in req:
+    marker = req['scratch']
+    result['tmpEnv'] = os.environ.get('TMPDIR')
+    result['tmpInode'] = os.stat('/tmp').st_ino
+    result['varTmpInode'] = os.stat('/var/tmp').st_ino
+    result['tmpDevice'] = os.stat('/tmp').st_dev
+    result['varTmpDevice'] = os.stat('/var/tmp').st_dev
+    result['guestFile'] = os.path.exists('/tmp/' + req['guestFile'])
+    result['otherScratch'] = denied(lambda: os.stat(req['otherScratch']))
+    result['existingScratch'] = os.path.exists('/tmp/' + marker)
+    subprocess.run(['/bin/sh', '-ec', 'touch "/tmp/$1" "/var/tmp/$1"', 'sh', marker], check=True)
+    # A pathname socket using the literal /tmp path, as used by browser tools.
+    with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as client:
+        path = '/tmp/' + marker + '.sock'
+        server.bind(path)
+        server.listen(1)
+        client.connect(path)
+        conn, _ = server.accept()
+        conn.close()
+        os.unlink(path)
+    if req.get('nested'):
+        subprocess.run(['/usr/bin/bwrap', '--dev-bind', '/', '/', '--proc', '/proc', '--',
+                        '/bin/sh', '-ec', 'touch "/tmp/$1.nested"', 'sh', marker], check=True)
+    if req.get('readOnlyScratch'):
+        for root in ('/tmp', '/var/tmp'):
+            cache = os.path.join(root, 'cache')
+            os.mkdir(cache)
+            with open(os.path.join(cache, 'file'), 'w') as f:
+                f.write('read-only fixture')
+            for path in (os.path.join(cache, 'file'), cache, root):
+                os.chmod(path, 0o555)
 for arg in sys.argv:
     if arg.startswith('--mcp-config=') and arg.endswith('agent-mcp.json'):
         result['mcpMode'] = os.stat(arg.split('=', 1)[1]).st_mode & 0o777

@@ -26,7 +26,7 @@ const meta = store.create({
 });
 const cancelled: string[] = [];
 const runs = {
-  stats: () => ({ activeRuns: 0, agentsRunning: 0, agentsQueued: 0 }),
+  stats: () => ({ draining: false, activeRuns: 0, agentsRunning: 0, agentsQueued: 0 }),
   isActive: () => false,
   cancel: (id: string) => { cancelled.push(id); return true; },
   skipAgent: () => true,
@@ -176,7 +176,7 @@ test('Funnel traffic has no identity, whatever login it presents', async () => {
 test('only health and whoami answer anyone, and they carry no run content', async () => {
   const health = await call('/api/health');
   assert.equal(health.status, 200);
-  assert.deepEqual(JSON.parse(health.body), { ok: true, activeRuns: 0, agentsRunning: 0, agentsQueued: 0 });
+  assert.deepEqual(JSON.parse(health.body), { ok: true, draining: false, activeRuns: 0, agentsRunning: 0, agentsQueued: 0 });
 
   assert.deepEqual(JSON.parse((await call('/api/whoami')).body), { login: null, viewer: false, admin: false });
   assert.deepEqual(JSON.parse((await call('/api/whoami', as(STRANGER))).body), { login: STRANGER, viewer: false, admin: false });

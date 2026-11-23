@@ -8,11 +8,11 @@
  * Config: ~/.swarmbase/config.json (SWARMBASE_CONFIG overrides).
  */
 import { createHash } from 'node:crypto';
-import { createServer } from 'node:http';
+import { createServer, type Server } from 'node:http';
 import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { DEFAULT_CONFIG_PATH, loadConfig, watchDashboardAccess } from './config.js';
-import { mcplHttp } from './listeners.js';
+import { adminHttp, mcplHttp } from './listeners.js';
 import { createDashboard, requestUrl } from './dashboard.js';
 import { addPrices, ensureEmptyMcpConfig, initLiveGroups } from './engines/claude.js';
 import { bwrapAvailable } from './engines/codex.js';
@@ -27,6 +27,20 @@ import { initializeCallerUsers } from './users.js';
 
 function log(line: string): void {
   console.error(`${new Date().toISOString()} [swarmbase] ${line}`);
+}
+
+async function listenUnix(server: Server, path: string, mode: number): Promise<void> {
+  if (existsSync(path)) {
+    if (!lstatSync(path).isSocket()) throw new Error(`${path} exists and is not a socket`);
+    unlinkSync(path);
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    // The UNIX socket is bound synchronously by listen(). Restrict its mode
+    // from creation, including when launched outside the systemd unit.
+    const mask = process.umask(0o777 & ~mode);
+    try { server.listen(path, resolve); } finally { process.umask(mask); }
+  });
 }
 
 async function main(): Promise<void> {
@@ -65,16 +79,11 @@ async function main(): Promise<void> {
   const dashboard = createDashboard(cfg, store, runs, notifier, dashboardAccess);
   const http = createServer(cfg.dashboardSocket ? mcplHttp : dashboard);
   const privateDashboard = cfg.dashboardSocket ? createServer(dashboard) : null;
-  if (cfg.dashboardSocket && privateDashboard) {
-    if (existsSync(cfg.dashboardSocket)) {
-      if (!lstatSync(cfg.dashboardSocket).isSocket()) throw new Error('dashboardSocket exists and is not a socket');
-      unlinkSync(cfg.dashboardSocket);
-    }
-    await new Promise<void>((resolve, reject) => {
-      privateDashboard.once('error', reject);
-      privateDashboard.listen(cfg.dashboardSocket!, resolve);
-    });
+  const admin = cfg.dashboardSocket ? createServer(adminHttp(runs)) : null;
+  if (cfg.dashboardSocket && privateDashboard && admin) {
+    await listenUnix(privateDashboard, cfg.dashboardSocket, 0o660);
     chmodSync(cfg.dashboardSocket, 0o660);
+    await listenUnix(admin, `${cfg.dashboardSocket}.admin`, 0o600);
   }
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
@@ -113,6 +122,7 @@ async function main(): Promise<void> {
     for (const c of wss.clients) c.terminate();
     http.close();
     privateDashboard?.close();
+    admin?.close();
     setTimeout(() => process.exit(0), 1500).unref();
   };
   process.on('SIGTERM', () => stop('SIGTERM'));

@@ -43,7 +43,7 @@ test('privilege helper argument building: fixed sudo command, caller identity, n
   process.env.DAEMON_SECRET = 'other-caller-token';
   try {
     const plan = buildAgentLaunch('/usr/bin/claude', ['--tools=Bash', 'literal;$(id)'], '/home/swarm-a/work',
-      { HOME: '/home/swarm-a/temp', ANTHROPIC_API_KEY: 'own-key' }, 'hello\nworld', user);
+      { HOME: '/home/swarm-a/temp', ANTHROPIC_API_KEY: 'own-key' }, 'hello\nworld', user, { workDir: '/home/swarm-a/run/work' });
     assert.equal(plan.cwd, '/');
     assert.equal(plan.keepOpen, true);
     assert.deepEqual(plan.env, { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' });
@@ -52,6 +52,7 @@ test('privilege helper argument building: fixed sudo command, caller identity, n
     assert.equal(payload.env.ANTHROPIC_API_KEY, 'own-key');
     assert.equal(payload.env.DAEMON_SECRET, undefined);
     assert.equal(payload.prompt, 'hello\nworld');
+    assert.equal(payload.workDir, '/home/swarm-a/run/work');
     assert.deepEqual(payload.args, ['--tools=Bash', 'literal;$(id)']);
   } finally {
     if (saved === undefined) delete process.env.DAEMON_SECRET; else process.env.DAEMON_SECRET = saved;
@@ -61,7 +62,7 @@ test('privilege helper argument building: fixed sudo command, caller identity, n
 test('codex outer bubblewrap is the helper command child, including staged caller-only bearer/config files', () => {
   const plan = buildAgentLaunch('bwrap', ['--unshare-user', '--', '/usr/bin/codex', 'exec'], '/home/swarm-a/work',
     { CODEX_HOME: '/home/swarm-a/1-home' }, 'prompt', user,
-    { home: '/home/swarm-a/1-home', files: { 'config.toml': 'bearer=per-agent-token' } });
+    { workDir: '/home/swarm-a/work', files: { home: '/home/swarm-a/1-home', files: { 'config.toml': 'bearer=per-agent-token' } } });
   const payload = JSON.parse(plan.input);
   assert.equal(payload.command, 'bwrap');
   assert.deepEqual(payload.args.slice(-2), ['/usr/bin/codex', 'exec']);
@@ -80,6 +81,7 @@ test('isolated codex uses the pinned cwd for both the outer mount and CLI chdir'
   const s = { callerUser: user, cwd: '/home/swarm-a/work', homeDir: '/home/swarm-a/1-home', profile: 'write',
     codexBin: '/usr/bin/codex', model: 'fake', extraRoBinds: [] } as unknown as CodexAgentSpec;
   const outer = bwrapArgs(s, {});
+  assert.match(outer.join(' '), /--bind \/tmp \/tmp --bind \/var\/tmp \/var\/tmp/);
   const pinned = outer.indexOf(PINNED_CWD);
   assert.equal(outer[pinned - 1], '--bind-fd');
   assert.equal(outer[pinned + 1], s.cwd);
@@ -111,7 +113,8 @@ test('mocked privilege helper receives explicit payload and cancellation over th
     assert.deepEqual(opts.env, { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' });
     return child;
   }) as unknown as typeof spawn;
-  const launched = spawnAgent('claude', ['-p'], '/home/swarm-a/work', { HOME: '/home/swarm-a', ANTHROPIC_API_KEY: 'only-a' }, 'prompt', user, undefined, mock);
+  const launched = spawnAgent('claude', ['-p'], '/home/swarm-a/work', { HOME: '/home/swarm-a', ANTHROPIC_API_KEY: 'only-a' }, 'prompt', user,
+    { workDir: '/home/swarm-a/work' }, mock);
   assert.equal(launched, child);
   assert.equal(child.stdin.writableEnded, false, 'pipe lifetime is the supervisor lifetime');
   const request = JSON.parse(input);
@@ -145,7 +148,7 @@ test('protected ancestor checks follow key symlinks and intermediate symlinks, e
 });
 
 test('helper filesystem operations use current unprivileged uid, private modes and symlink-safe removal',
-  { skip: process.getuid?.() === 0 || !['linux', 'darwin'].includes(process.platform) }, () => {
+  { skip: process.getuid?.() === 0 || process.platform !== 'linux' }, () => {
     const helper = fileURLToPath(new URL('../../scripts/swarmbase-user', import.meta.url));
     // Compiled tests live in dist/test; source tests live in test.
     const path = helper.includes('/dist/scripts/') ? helper.replace('/dist/scripts/', '/scripts/') : helper;

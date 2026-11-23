@@ -297,15 +297,19 @@ export class RunStore {
 
   /** Delete the throwaway homes a crashed daemon left behind (an engine deletes
    *  its own when the agent ends). Returns how many went. */
-  sweepAgentHomes(meta: RunMeta): number {
-    const user = this.userContext(meta);
+  sweepAgentHomes(meta: RunMeta, onError: (error: unknown) => void): number {
+    let user: CallerUser | undefined;
+    try { user = this.userContext(meta); } catch (e) { onError(e); return 0; }
     if (user) {
       let n = 0;
       // Agent count is recorded by the daemon; never enumerate caller paths and
       // then delete them with daemon authority.
       for (let i = 1; i <= meta.agentsTotal; i++) {
-        userOperation(user, { op: 'remove', path: this.agentHomeDir(meta, i) });
-        n++;
+        try {
+          if (userOperation(user, { op: 'remove', path: agentHome(user, meta.id, i) })) n++;
+        } catch (e) {
+          onError(e);
+        }
       }
       return n;
     }
@@ -326,14 +330,14 @@ export class RunStore {
     return join(meta.dir, 'work');
   }
 
-  /** Remove everything under the run's `work/` and leave the (empty) directory in place.
-   *  Only ever touches `<run dir>/work`: if an agent replaced `work` itself with a symlink
-   *  it is unlinked, never followed (entries inside are unlinked by rmSync anyway). Trees
+  /** Remove the run's work and caller-owned scratch, leaving an empty `work/`.
+   *  If an agent replaced `work` itself with a symlink it is unlinked, never
+   *  followed (entries inside are unlinked by rmSync anyway). Trees
    *  a toolchain left read-only (Go's module cache is 0555) are made writable and retried.
    *  Returns false when nothing was there. */
   deleteWork(meta: RunMeta): boolean {
     const user = this.userContext(meta);
-    if (user) return userOperation(user, { op: 'remove', path: this.workDir(meta), recreate: true });
+    if (user) return userOperation(user, { op: 'removeWork', path: this.workDir(meta) });
     const dir = this.workDir(meta);
     let st;
     try { st = lstatSync(dir); } catch { return false; }
