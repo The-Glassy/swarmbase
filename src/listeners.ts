@@ -12,11 +12,18 @@ export const mcplHttp: RequestListener = (req, res) => {
 };
 
 /** Only served on the owner-only admin socket. The dashboard proxy cannot reach it. */
-export function adminHttp(runs: RunManager): RequestListener {
+export function adminHttp(runs: RunManager, log: (line: string) => void): RequestListener {
   return (req, res) => {
-    if (req.method === 'POST' && req.url === '/api/drain') runs.draining = true;
-    else if (req.method === 'DELETE' && req.url === '/api/drain') runs.draining = false;
-    else if (req.method !== 'GET' || req.url !== '/api/health') {
+    const url = requestUrl(req);
+    if (req.method === 'POST' && url?.pathname === '/api/drain') {
+      const ttlMs = url.searchParams.get('ttlMs');
+      if (!runs.startDrain(() => log('Maintenance drain expired; run and resume admission reopened.'), ttlMs === null ? undefined : Number(ttlMs))) {
+        res.writeHead(400).end('ttlMs must be a positive integer no greater than 2147483647\n');
+        return;
+      }
+    } else if (req.method === 'DELETE' && req.url === '/api/drain') {
+      runs.releaseDrain();
+    } else if (req.method !== 'GET' || req.url !== '/api/health') {
       res.writeHead(404).end('not found\n');
       return;
     }

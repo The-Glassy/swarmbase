@@ -8,12 +8,13 @@ import { createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { WebSocket } from 'ws';
 import type { ToolResult } from '../src/session.js';
 
-test('the private drain closes existing MCPL sessions to run and resume, and resets on restart', { timeout: 15_000 }, async () => {
+test('the private drain closes existing MCPL sessions to run and resume, and resets on restart', { timeout: 15_000 }, async (t) => {
   const probe = createServer().listen(0, '127.0.0.1');
   await once(probe, 'listening');
   const port = (probe.address() as AddressInfo).port;
@@ -44,7 +45,7 @@ test('the private drain closes existing MCPL sessions to run and resume, and res
     });
   }
 
-  async function withDaemon(check: (conn: McplConnection) => Promise<void>) {
+  async function withDaemon(check: (conn: McplConnection, logs: () => string) => Promise<void>) {
     const daemon = spawn(process.execPath, [fileURLToPath(new URL('../src/index.js', import.meta.url))], {
       env: { ...process.env, SWARMBASE_CONFIG: configPath }, stdio: ['ignore', 'ignore', 'pipe'],
     });
@@ -57,12 +58,12 @@ test('the private drain closes existing MCPL sessions to run and resume, and res
         if (logs.includes('listening on')) break;
       }
       assert.match(logs, /listening on/);
-      daemon.stderr.resume();
+      daemon.stderr.on('data', (chunk) => { logs += chunk; });
       ws = new WebSocket(`ws://127.0.0.1:${port}/mcpl?token=${token}`);
       await once(ws, 'open');
       const conn = McplConnection.fromWebSocket(ws as never);
       await conn.sendRequest('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'drain-test', version: '0' } }, 2000);
-      await check(conn);
+      await check(conn, () => logs);
     } finally {
       ws?.terminate();
       daemon.kill();
@@ -76,7 +77,7 @@ test('the private drain closes existing MCPL sessions to run and resume, and res
 
   try {
     let runId = '';
-    await withDaemon(async (conn) => {
+    await withDaemon(async (conn, logs) => {
       const started = await call(conn, 'run', { script: 'await new Promise(() => {});' });
       runId = started.content[0].text.match(/Started run (\S+)/)?.[1] ?? '';
       assert.ok(runId, started.content[0].text);
@@ -95,6 +96,27 @@ test('the private drain closes existing MCPL sessions to run and resume, and res
       }
       assert.equal((await health()).activeRuns, 0);
       assert.equal(JSON.parse((await http('/api/drain', adminSocket, 'DELETE')).body).draining, false);
+      await t.test('repeat POST renews the drain, and expiry logs and reopens admission', async () => {
+        const expiry = /Maintenance drain expired; run and resume admission reopened\./;
+        assert.equal((await http('/api/drain?ttlMs=500', adminSocket, 'POST')).status, 200);
+        assert.equal((await http('/api/drain', adminSocket, 'POST')).status, 200);
+        await delay(550);
+        assert.doesNotMatch(logs(), expiry);
+        assert.equal((await health()).draining, true);
+        assert.equal((await http('/api/drain?ttlMs=2147483648', adminSocket, 'POST')).status, 400);
+        assert.equal((await health()).draining, true);
+
+        assert.equal((await http('/api/drain?ttlMs=100', adminSocket, 'POST')).status, 200);
+        for (let i = 0; i < 100 && !expiry.test(logs()); i++) await delay(20);
+        assert.match(logs(), expiry);
+        assert.equal((await health()).draining, false);
+        const resumed = await call(conn, 'resume', { runId, script: 'return 1;' });
+        assert.equal(resumed.isError, undefined, resumed.content[0].text);
+        assert.match(resumed.content[0].text, /Started run/);
+        const started = await call(conn, 'run', { script: 'return 1;' });
+        assert.equal(started.isError, undefined, started.content[0].text);
+        assert.match(started.content[0].text, /Started run/);
+      });
       assert.equal((await http('/api/drain', adminSocket, 'POST')).status, 200);
     });
     await withDaemon(async (conn) => {

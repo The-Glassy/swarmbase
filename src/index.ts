@@ -79,7 +79,7 @@ async function main(): Promise<void> {
   const dashboard = createDashboard(cfg, store, runs, notifier, dashboardAccess);
   const http = createServer(cfg.dashboardSocket ? mcplHttp : dashboard);
   const privateDashboard = cfg.dashboardSocket ? createServer(dashboard) : null;
-  const admin = cfg.dashboardSocket ? createServer(adminHttp(runs)) : null;
+  const admin = cfg.dashboardSocket ? createServer(adminHttp(runs, log)) : null;
   if (cfg.dashboardSocket && privateDashboard && admin) {
     await listenUnix(privateDashboard, cfg.dashboardSocket, 0o660);
     chmodSync(cfg.dashboardSocket, 0o660);

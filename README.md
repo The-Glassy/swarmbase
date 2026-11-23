@@ -367,6 +367,10 @@ allowlist blocks DNS rebinding.
 When `dashboardSocket` is configured, the daemon creates an owner-only admin socket with `.admin`
 appended to that path. Use `POST /api/drain` there to reject new `run` and `resume` calls with a
 retryable maintenance error, including on connections already open. Existing runs can finish.
+The drain expires after 15 minutes by default. Set a different duration with
+`POST /api/drain?ttlMs=<milliseconds>` using a positive integer up to 2147483647.
+Each successful POST sets a fresh deadline from that request. At expiry the daemon logs
+the event and automatically reopens admission.
 Poll `GET /api/health` on either private socket until `draining` is true and `activeRuns`,
 `agentsRunning`, and `agentsQueued` are all zero. Send `DELETE /api/drain` on the admin socket to
 release the drain if maintenance is aborted. Each daemon start opens admission.

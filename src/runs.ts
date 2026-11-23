@@ -41,6 +41,7 @@ const WATCHDOG_INTERVAL_MS = 30_000;
 const WATCHDOG_DEAD_MS = 120_000;
 /** The longest delay setTimeout takes; anything longer fires at once. */
 const TIMER_MAX_MS = 2_147_483_647;
+const DEFAULT_DRAIN_TTL_MS = 15 * 60_000;
 /** An agent's default USD cap is budget/8, up to this. Above it a large budget would
  *  only make each reservation bigger, keeping a run to 8 agents at once for no reason. */
 const AGENT_DEFAULT_USD_CEILING = 10_000;
@@ -107,6 +108,7 @@ export class RunManager {
   private active = new Map<string, ActiveRun>();
   private globalSem: Semaphore;
   private callerSems = new Map<string, Semaphore>();
+  private drainTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly cfg: Config,
@@ -141,7 +143,24 @@ export class RunManager {
   }
 
   // Process-local so a restart always opens admission again.
-  draining = false;
+  get draining(): boolean {
+    return this.drainTimer !== undefined;
+  }
+
+  startDrain(onExpiry: () => void, ttlMs = DEFAULT_DRAIN_TTL_MS): boolean {
+    if (!Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > TIMER_MAX_MS) return false;
+    this.releaseDrain();
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = undefined;
+      onExpiry();
+    }, ttlMs).unref();
+    return true;
+  }
+
+  releaseDrain(): void {
+    clearTimeout(this.drainTimer);
+    this.drainTimer = undefined;
+  }
 
   stats(): { draining: boolean; activeRuns: number; agentsRunning: number; agentsQueued: number } {
     return { draining: this.draining, activeRuns: this.active.size, agentsRunning: this.globalSem.active, agentsQueued: this.globalSem.queued };
